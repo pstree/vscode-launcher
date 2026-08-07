@@ -1,0 +1,73 @@
+{
+  "name": "vscode-launcher",
+  "displayName": "Multi Launch",
+  "description": "在运行和调试面板中多选 launch 配置并同时启动，Java 配置自动注入 JMX 端口",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "views": {
+      "debug": [
+        {
+          "id": "multiLauncherView",
+          "name": "多选自启动"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "multiLauncher.launchSelected",
+        "title": "启动选中项",
+        "category": "Multi Launch",
+        "icon": "$(play)"
+      },
+      {
+        "command": "multiLauncher.launchOne",
+        "title": "启动",
+        "icon": "$(play)"
+      },
+      {
+        "command": "multiLauncher.stopOne",
+        "title": "停止",
+        "icon": "$(stop)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "multiLauncher.launchSelected",
+          "when": "view == multiLauncherView",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "multiLauncher.launchOne",
+          "when": "view == multiLauncherView && viewItem != running",
+          "group": "inline"
+        },
+        {
+          "command": "multiLauncher.stopOne",
+          "when": "view == multiLauncherView && viewItem == running",
+          "group": "inline"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.4.0"
+  }
+}
