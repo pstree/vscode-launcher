@@ -54,6 +54,9 @@ interface SessionEntry {
   jmx?: number;
   rmi?: number;
   appPort?: number;
+  portVerified?: boolean; // 端口已权威确认标志
+  outputBuffer?: string;
+  pollTimer?: NodeJS.Timeout;
   terminal?: vscode.Terminal;
 }
 
@@ -129,10 +132,16 @@ function mergeVmArgs(original: string | string[] | undefined, jmxArgs: string): 
 // ---------------------------------------------------------------------------
 
 const DEFAULT_PORT_PATTERNS: RegExp[] = [
-  /Tomcat started on port\(s\):\s*(\d+)/i,
-  /started on port\s*:?\s*(\d+)/i,
-  /Started .*? on port\(s\)\s*(\d+)/i,
-  /(?:Listening on|server.*?port).*?(\d+)/i,
+  /Tomcat started on port(?:\(s\))?:?\s*(\d+)/i,
+  /Tomcat initialized with port(?:\(s\))?:?\s*(\d+)/i,
+  /(?:Netty|Undertow|Jetty|WebServer|Web server)\s+started on port(?:\(s\))?:?\s*(\d+)/i,
+  /Started \w+ in \d+.*?\bport(?:\(s\))?:?\s*(\d+)/i,
+  /Started .*? on port(?:\(s\))?:?\s*(\d+)/i,
+  /process running on port\s*:?\s*(\d+)/i,
+  /(?:Listening on|Server started on|App running on)\s+(?:http:\/\/[^\s:]+:)?(\d+)/i,
+  /(?:Local|Network):\s+http:\/\/[^\s:]+:(\d+)/i,
+  /\bstarted on port(?:\(s\))?:?\s*(\d+)/i,
+  /\bport(?:\(s\))?\s*[:=]?\s*(\d{2,5})\b/i,
 ];
 
 function getPortPatterns(): RegExp[] {
@@ -155,12 +164,204 @@ function extractAppPort(text: string, patterns: RegExp[]): number | undefined {
     const m = re.exec(text);
     if (m && m[1]) {
       const p = parseInt(m[1], 10);
-      if (!isNaN(p)) {
+      if (!isNaN(p) && p > 0 && p < 65536) {
         return p;
       }
     }
   }
   return undefined;
+}
+
+/** 从进程命令行解析 JDWP 调试端口 (address=XXXX) */
+function extractJdwpPortFromCommandLine(commandLine: string): number | undefined {
+  const m = /address=(?:[^\s:]+:)?(\d+)/i.exec(commandLine);
+  if (m && m[1]) {
+    const p = parseInt(m[1], 10);
+    if (!isNaN(p) && p > 0 && p < 65536) {
+      return p;
+    }
+  }
+  return undefined;
+}
+
+/** 挑选最佳应用端口（优先 < 32768 的标准端口，排除动态高位调试端口） */
+function selectBestAppPort(ports: number[]): number | undefined {
+  if (ports.length === 0) {
+    return undefined;
+  }
+  if (ports.length === 1) {
+    return ports[0];
+  }
+  const sorted = [...ports].sort((a, b) => {
+    const aEph = a >= 32768;
+    const bEph = b >= 32768;
+    if (aEph !== bEph) {
+      return aEph ? 1 : -1;
+    }
+    return a - b;
+  });
+  return sorted[0];
+}
+
+/** 查询指定 PIDs 在操作系统层面监听的 TCP 端口 */
+async function getListeningPortsForPids(pids: number[], excluded: Set<number>): Promise<number[]> {
+  const ports: number[] = [];
+  const uniquePids = Array.from(new Set(pids.filter((p) => p && p > 0)));
+  if (uniquePids.length === 0) {
+    return ports;
+  }
+  if (process.platform === 'win32') {
+    for (const pid of uniquePids) {
+      const netCmd = `powershell -NoProfile -Command "Get-NetTCPConnection -OwningProcess ${pid} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort"`;
+      try {
+        const { stdout } = await promisify(exec)(netCmd);
+        const pidPorts = stdout
+          .split(/[\r\n]+/)
+          .map((s) => parseInt(s.trim(), 10))
+          .filter((n) => !isNaN(n) && n > 0);
+        for (const p of pidPorts) {
+          if (!excluded.has(p)) {
+            ports.push(p);
+          }
+        }
+      } catch {}
+    }
+  } else {
+    for (const pid of uniquePids) {
+      try {
+        const cmd = `lsof -a -p ${pid} -i -a -sTCP:LISTEN -P -n 2>/dev/null`;
+        const { stdout } = await promisify(exec)(cmd);
+        const matches = stdout.matchAll(/:(\d+)\s+\(LISTEN\)/g);
+        for (const m of matches) {
+          const p = parseInt(m[1], 10);
+          if (!isNaN(p) && !excluded.has(p)) {
+            ports.push(p);
+          }
+        }
+      } catch {}
+    }
+    if (ports.length === 0 && process.platform === 'linux') {
+      try {
+        const { stdout } = await promisify(exec)(`ss -tlnp 2>/dev/null`);
+        const lines = stdout.split(/[\r\n]+/);
+        for (const pid of uniquePids) {
+          for (const line of lines) {
+            if (line.includes(`pid=${pid},`)) {
+              const match = /:(\d+)\s+/.exec(line);
+              if (match && match[1]) {
+                const p = parseInt(match[1], 10);
+                if (!isNaN(p) && !excluded.has(p)) {
+                  ports.push(p);
+                }
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+  return Array.from(new Set(ports));
+}
+
+/** 探测指定 session/配置名在操作系统中的 TCP 监听端口 */
+async function findListeningPortsForSession(
+  name: string,
+  terminal?: vscode.Terminal,
+  excluded: Set<number> = new Set()
+): Promise<number[]> {
+  const pids: number[] = [];
+  const markerId = getMarkerId(name);
+
+  if (process.platform === 'win32') {
+    const safeMarker = markerId.replace(/'/g, "''");
+    const psCmd = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'CommandLine like ''%multiLauncher.id=${safeMarker}%''' | Select-Object ProcessId, CommandLine | ConvertTo-Json"`;
+    try {
+      const { stdout } = await promisify(exec)(psCmd);
+      if (stdout.trim()) {
+        const parsed = JSON.parse(stdout);
+        const list = Array.isArray(parsed) ? parsed : [parsed];
+        for (const item of list) {
+          if (item.ProcessId) {
+            pids.push(item.ProcessId);
+          }
+          if (item.CommandLine) {
+            const jdwp = extractJdwpPortFromCommandLine(item.CommandLine);
+            if (jdwp) {
+              excluded.add(jdwp);
+            }
+          }
+        }
+      }
+    } catch {}
+  } else {
+    const safeMarker = markerId.replace(/'/g, "'\\''");
+    const cmd = `pgrep -f 'multiLauncher.id=${safeMarker}'`;
+    try {
+      const { stdout } = await promisify(exec)(cmd);
+      const found = stdout
+        .split(/[\r\n]+/)
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => !isNaN(n) && n > 0);
+      pids.push(...found);
+      for (const pid of found) {
+        try {
+          const { stdout: psOut } = await promisify(exec)(`ps -p ${pid} -o command=`);
+          const jdwp = extractJdwpPortFromCommandLine(psOut);
+          if (jdwp) {
+            excluded.add(jdwp);
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  if (terminal) {
+    try {
+      const termPid = await terminal.processId;
+      if (termPid) {
+        pids.push(termPid);
+        if (process.platform === 'win32') {
+          const c1 = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${termPid}' | Select-Object -ExpandProperty ProcessId"`;
+          const { stdout: o1 } = await promisify(exec)(c1);
+          const c1p = o1.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
+          pids.push(...c1p);
+          for (const c of c1p) {
+            const c2 = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${c}' | Select-Object -ExpandProperty ProcessId"`;
+            try {
+              const { stdout: o2 } = await promisify(exec)(c2);
+              const c2p = o2.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
+              pids.push(...c2p);
+            } catch {}
+          }
+        } else {
+          try {
+            const { stdout: o1 } = await promisify(exec)(`pgrep -P ${termPid}`);
+            const c1p = o1.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
+            pids.push(...c1p);
+            for (const c of c1p) {
+              try {
+                const { stdout: o2 } = await promisify(exec)(`pgrep -P ${c}`);
+                const c2p = o2.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
+                pids.push(...c2p);
+              } catch {}
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  const uniquePids = Array.from(new Set(pids));
+  return getListeningPortsForPids(uniquePids, excluded);
+}
+
+/** 判断配置类型是否为 Java / Spring Boot 项目 */
+function isJavaConfig(type: string): boolean {
+  if (!type) {
+    return false;
+  }
+  const t = type.toLowerCase();
+  return t === 'java' || t === 'boot' || t === 'spring-boot' || t.includes('java') || t.includes('boot');
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +486,7 @@ async function launchConfig(cfg: LaunchConfig, used: Set<number>): Promise<void>
   const markerId = getMarkerId(cfg.name);
   const marker = `-DmultiLauncher.id=${markerId}`;
 
-  if (cfg.type === 'java') {
+  if (isJavaConfig(cfg.type)) {
     const { jmx, rmi } = await allocPorts(cfg.name, used);
     resolved.vmArgs = mergeVmArgs(cfg.raw.vmArgs, `${buildJmxArgs(jmx, rmi)} ${marker}`);
     (resolved as any)[LAUNCHED_BY_US] = true;
@@ -324,6 +525,10 @@ async function stopConfig(
 
   // 2) 断开调试会话并关闭关联终端
   for (const e of entries) {
+    if (e.pollTimer) {
+      clearInterval(e.pollTimer);
+      e.pollTimer = undefined;
+    }
     try {
       await vscode.debug.stopDebugging(e.session);
     } catch {
@@ -331,7 +536,8 @@ async function stopConfig(
     }
     if (e.terminal) {
       try {
-        e.terminal.dispose();
+        e.terminal.sendText('\x03', true); // 发送 Ctrl+C 中断信号
+        e.terminal.dispose(); // 关闭集成终端
       } catch {}
     }
   }
@@ -340,6 +546,7 @@ async function stopConfig(
   const remainingTerms = findMatchingTerminals(cfg.name, unclaimedTerminal);
   for (const term of remainingTerms) {
     try {
+      term.sendText('\x03', true);
       term.dispose();
     } catch {}
   }
@@ -389,6 +596,45 @@ export function activate(context: vscode.ExtensionContext) {
 
       list.push(entry);
       sessionMap.set(name, list);
+
+      // 开启主动轮询：在操作系统层面探测该 session 的 TCP 监听端口
+      // （解决 console: integratedTerminal 时 DAP 收不到日志、端口解析不到的问题）
+      const excluded = new Set<number>();
+      if (entry.jmx) {
+        excluded.add(entry.jmx);
+      }
+      if (entry.rmi) {
+        excluded.add(entry.rmi);
+      }
+      const configObj = session.configuration as any;
+      if (typeof configObj.port === 'number') {
+        excluded.add(configObj.port);
+      }
+      if (typeof configObj.debugPort === 'number') {
+        excluded.add(configObj.debugPort);
+      }
+      if (typeof configObj.jdwpPort === 'number') {
+        excluded.add(configObj.jdwpPort);
+      }
+
+      let attempts = 0;
+      entry.pollTimer = setInterval(async () => {
+        attempts++;
+        if (entry.portVerified || attempts > 20) {
+          if (entry.pollTimer) {
+            clearInterval(entry.pollTimer);
+            entry.pollTimer = undefined;
+          }
+          return;
+        }
+        const ports = await findListeningPortsForSession(name, entry.terminal, excluded);
+        const bestPort = selectBestAppPort(ports);
+        if (bestPort !== undefined && !entry.portVerified) {
+          entry.appPort = bestPort;
+          provider.refresh();
+        }
+      }, 1500);
+
       provider.refresh();
     })
   );
@@ -431,11 +677,20 @@ export function activate(context: vscode.ExtensionContext) {
               if (!text) {
                 return;
               }
-              const port = extractAppPort(text, patterns);
-              if (port !== undefined) {
-                const entry = (sessionMap.get(name) ?? []).find((x) => x.session.id === session.id);
-                if (entry && entry.appPort === undefined) {
+              const entry = (sessionMap.get(name) ?? []).find((x) => x.session.id === session.id);
+              if (entry && !entry.portVerified) {
+                entry.outputBuffer = (entry.outputBuffer ?? '') + text;
+                if (entry.outputBuffer.length > 20000) {
+                  entry.outputBuffer = entry.outputBuffer.slice(-20000);
+                }
+                const port = extractAppPort(entry.outputBuffer, patterns);
+                if (port !== undefined) {
                   entry.appPort = port;
+                  entry.portVerified = true;
+                  if (entry.pollTimer) {
+                    clearInterval(entry.pollTimer);
+                    entry.pollTimer = undefined;
+                  }
                   provider.refresh();
                 }
               }
@@ -461,6 +716,10 @@ export function activate(context: vscode.ExtensionContext) {
       const idx = list.findIndex((e) => e.session.id === session.id);
       if (idx >= 0) {
         const [entry] = list.splice(idx, 1);
+        if (entry.pollTimer) {
+          clearInterval(entry.pollTimer);
+          entry.pollTimer = undefined;
+        }
         if (list.length === 0) {
           sessionMap.delete(name);
         }
@@ -470,12 +729,14 @@ export function activate(context: vscode.ExtensionContext) {
           await killProcessByMarker(name);
           if (entry.terminal) {
             try {
+              entry.terminal.sendText('\x03', true);
               entry.terminal.dispose();
             } catch {}
           }
           const terms = findMatchingTerminals(name, lastUnclaimedTerminal);
           for (const term of terms) {
             try {
+              term.sendText('\x03', true);
               term.dispose();
             } catch {}
           }
