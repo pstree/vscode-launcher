@@ -54,8 +54,10 @@ interface SessionEntry {
   appPort?: number;
   portVerified?: boolean; // 端口已权威确认标志
   outputBuffer?: string;
-  pollTimer?: NodeJS.Timeout;
   terminal?: vscode.Terminal;
+  pollAttempts?: number; // 主动轮询尝试次数（用于退避与上限）
+  pollExcluded?: Set<number>; // 需从监听端口中排除的端口集合
+  jdwpChecked?: boolean; // 是否已尝试从进程命令行提取 JDWP 端口
 }
 
 // ---------------------------------------------------------------------------
@@ -201,29 +203,48 @@ function selectBestAppPort(ports: number[]): number | undefined {
   return sorted[0];
 }
 
-/** 查询指定 PIDs 在操作系统层面监听的 TCP 端口 */
-async function getListeningPortsForPids(pids: number[], excluded: Set<number>): Promise<number[]> {
-  const ports: number[] = [];
+/** 查询指定 PIDs 在操作系统层面监听的 TCP 端口，返回 pid → ports 的映射 */
+async function getListeningPortsForPids(
+  pids: number[],
+  excluded: Set<number>
+): Promise<Map<number, number[]>> {
+  const result = new Map<number, number[]>();
   const uniquePids = Array.from(new Set(pids.filter((p) => p && p > 0)));
   if (uniquePids.length === 0) {
-    return ports;
+    return result;
   }
-  if (process.platform === 'win32') {
-    for (const pid of uniquePids) {
-      const netCmd = `powershell -NoProfile -Command "Get-NetTCPConnection -OwningProcess ${pid} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalPort"`;
-      try {
-        const { stdout } = await promisify(exec)(netCmd);
-        const pidPorts = stdout
-          .split(/[\r\n]+/)
-          .map((s) => parseInt(s.trim(), 10))
-          .filter((n) => !isNaN(n) && n > 0);
-        for (const p of pidPorts) {
-          if (!excluded.has(p)) {
-            ports.push(p);
-          }
-        }
-      } catch {}
+  const add = (pid: number, port: number) => {
+    if (isNaN(port) || port <= 0 || excluded.has(port)) {
+      return;
     }
+    const list = result.get(pid) ?? [];
+    if (!list.includes(port)) {
+      list.push(port);
+      result.set(pid, list);
+    }
+  };
+  if (process.platform === 'win32') {
+    // 合并所有 PID 为一条 PowerShell 命令查询，避免逐 PID fork powershell 进程，
+    // 同时保留 OwningProcess 以便正确归属端口。
+    const pidList = uniquePids.join(',');
+    const netCmd = `powershell -NoProfile -Command "Get-NetTCPConnection -OwningProcess @(${pidList}) -State Listen -ErrorAction SilentlyContinue | Select-Object OwningProcess, LocalPort | ConvertTo-Csv -NoTypeInformation"`;
+    try {
+      const { stdout } = await promisify(exec)(netCmd);
+      // CSV 首行为表头
+      stdout
+        .split(/[\r\n]+/)
+        .slice(1)
+        .forEach((line) => {
+          const cols = line.split(',');
+          if (cols.length >= 2) {
+            const pid = parseInt(cols[0].replace(/"/g, ''), 10);
+            const port = parseInt(cols[1].replace(/"/g, ''), 10);
+            if (!isNaN(pid) && pid > 0) {
+              add(pid, port);
+            }
+          }
+        });
+    } catch {}
   } else {
     for (const pid of uniquePids) {
       try {
@@ -231,14 +252,11 @@ async function getListeningPortsForPids(pids: number[], excluded: Set<number>): 
         const { stdout } = await promisify(exec)(cmd);
         const matches = stdout.matchAll(/:(\d+)\s+\(LISTEN\)/g);
         for (const m of matches) {
-          const p = parseInt(m[1], 10);
-          if (!isNaN(p) && !excluded.has(p)) {
-            ports.push(p);
-          }
+          add(pid, parseInt(m[1], 10));
         }
       } catch {}
     }
-    if (ports.length === 0 && process.platform === 'linux') {
+    if (result.size === 0 && process.platform === 'linux') {
       try {
         const { stdout } = await promisify(exec)(`ss -tlnp 2>/dev/null`);
         const lines = stdout.split(/[\r\n]+/);
@@ -247,10 +265,7 @@ async function getListeningPortsForPids(pids: number[], excluded: Set<number>): 
             if (line.includes(`pid=${pid},`)) {
               const match = /:(\d+)\s+/.exec(line);
               if (match && match[1]) {
-                const p = parseInt(match[1], 10);
-                if (!isNaN(p) && !excluded.has(p)) {
-                  ports.push(p);
-                }
+                add(pid, parseInt(match[1], 10));
               }
             }
           }
@@ -258,38 +273,27 @@ async function getListeningPortsForPids(pids: number[], excluded: Set<number>): 
       } catch {}
     }
   }
-  return Array.from(new Set(ports));
+  return result;
 }
 
-/** 探测指定 session/配置名在操作系统中的 TCP 监听端口 */
-async function findListeningPortsForSession(
+/** 收集指定 session/配置名关联的进程 PID（marker 进程 + 集成终端进程子树） */
+async function collectPidsForSession(
   name: string,
-  terminal?: vscode.Terminal,
-  excluded: Set<number> = new Set()
+  terminal?: vscode.Terminal
 ): Promise<number[]> {
   const pids: number[] = [];
   const markerId = getMarkerId(name);
 
   if (process.platform === 'win32') {
     const safeMarker = markerId.replace(/'/g, "''");
-    const psCmd = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'CommandLine like ''%multiLauncher.id=${safeMarker}%''' | Select-Object ProcessId, CommandLine | ConvertTo-Json"`;
+    const psCmd = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'CommandLine like ''%multiLauncher.id=${safeMarker}%''' | Select-Object -ExpandProperty ProcessId"`;
     try {
       const { stdout } = await promisify(exec)(psCmd);
-      if (stdout.trim()) {
-        const parsed = JSON.parse(stdout);
-        const list = Array.isArray(parsed) ? parsed : [parsed];
-        for (const item of list) {
-          if (item.ProcessId) {
-            pids.push(item.ProcessId);
-          }
-          if (item.CommandLine) {
-            const jdwp = extractJdwpPortFromCommandLine(item.CommandLine);
-            if (jdwp) {
-              excluded.add(jdwp);
-            }
-          }
-        }
-      }
+      const found = stdout
+        .split(/[\r\n]+/)
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => !isNaN(n) && n > 0);
+      pids.push(...found);
     } catch {}
   } else {
     const safeMarker = markerId.replace(/'/g, "'\\''");
@@ -301,15 +305,6 @@ async function findListeningPortsForSession(
         .map((s) => parseInt(s.trim(), 10))
         .filter((n) => !isNaN(n) && n > 0);
       pids.push(...found);
-      for (const pid of found) {
-        try {
-          const { stdout: psOut } = await promisify(exec)(`ps -p ${pid} -o command=`);
-          const jdwp = extractJdwpPortFromCommandLine(psOut);
-          if (jdwp) {
-            excluded.add(jdwp);
-          }
-        } catch {}
-      }
     } catch {}
   }
 
@@ -349,8 +344,123 @@ async function findListeningPortsForSession(
     } catch {}
   }
 
-  const uniquePids = Array.from(new Set(pids));
-  return getListeningPortsForPids(uniquePids, excluded);
+  return Array.from(new Set(pids.filter((p) => p && p > 0)));
+}
+
+// ---------------------------------------------------------------------------
+// 共享端口轮询器（模块级，供 activate 与 stopConfig 共用）
+// 相比「每个 session 一个定时器 + 每次 fork 多次 PowerShell」，显著降低 CPU 开销：
+//   - 单一 setInterval 统一轮询所有待探测 session，空闲时暂停；
+//   - 一次批量并发探测，外部进程 fork 次数大幅减少。
+// ---------------------------------------------------------------------------
+let treeProvider: MultiLaunchProvider | undefined; // 由 activate 赋值
+const pollPool = new Set<SessionEntry>(); // 待轮询的 session 集合
+const POLL_MAX_ATTEMPTS = 30; // 单 session 最大探测次数（对应最长 ~90s）
+let pollTimer: NodeJS.Timeout | undefined;
+let pollRunning = false; // 防止并发重入
+
+/** 将 session 加入轮询池，并在空闲时启动定时器 */
+function registerPolling(entry: SessionEntry): void {
+  pollPool.add(entry);
+  if (pollTimer) {
+    return;
+  }
+  pollTimer = setInterval(runPolling, 2000);
+}
+
+/** 将 session 移出轮询池；无待探测项时停止定时器 */
+function unregisterPolling(entry: SessionEntry): void {
+  pollPool.delete(entry);
+  if (pollPool.size === 0 && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = undefined;
+  }
+}
+
+/** 计算某 session 当前应使用的轮询间隔（退避：2s → 4s → 6s → ...） */
+function pollIntervalFor(entry: SessionEntry): number {
+  const attempts = entry.pollAttempts ?? 0;
+  return 2000 + Math.min(attempts, 10) * 2000;
+}
+
+/** 批量轮询：并发收集所有待探测 PID，一次性批量查询端口 */
+async function runPolling(): Promise<void> {
+  if (pollRunning || pollPool.size === 0) {
+    return;
+  }
+  pollRunning = true;
+  try {
+    const pending = Array.from(pollPool).filter((e) => !e.portVerified);
+    if (pending.length === 0) {
+      return;
+    }
+    // 并发收集每个 session 的 PID（会 fork 外部进程），再统一批量查端口
+    const pidsByName = await Promise.all(
+      pending.map(async (e) => {
+        const pids = await collectPidsForSession(e.session.configuration.name, e.terminal);
+        return { entry: e, pids };
+      })
+    );
+    const allPids = Array.from(new Set(pidsByName.flatMap((p) => p.pids)));
+
+    // 一次批量查询所有 PID 的监听端口（Win 下合并为单条 PowerShell 命令），
+    // 返回 pid → ports 映射，据此可正确区分每个 session 的端口归属。
+    const allPortMap =
+      allPids.length > 0 ? await getListeningPortsForPids(allPids, new Set()) : new Map<number, number[]>();
+
+    for (const { entry, pids } of pidsByName) {
+      entry.pollAttempts = (entry.pollAttempts ?? 0) + 1;
+      const excluded = entry.pollExcluded ?? new Set<number>();
+      // 首次轮询时，从各 PID 的命令行提取 JDWP 调试端口并排除，
+      // 避免把调试端口误判为应用端口（只做一次，降低开销）。
+      if (!entry.jdwpChecked && pids.length > 0) {
+        entry.jdwpChecked = true;
+        try {
+          const cmdLines = await Promise.all(
+            pids.map((pid) =>
+              promisify(exec)(
+                process.platform === 'win32'
+                  ? `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId = ${pid}\\").CommandLine"`
+                  : `ps -p ${pid} -o command=`
+              ).then((r) => r.stdout, () => '')
+            )
+          );
+          for (const cl of cmdLines) {
+            const jdwp = extractJdwpPortFromCommandLine(cl);
+            if (jdwp) {
+              excluded.add(jdwp);
+            }
+          }
+        } catch {}
+      }
+      // 汇总「属于本 session 各 PID」且未被排除的监听端口
+      const ports: number[] = [];
+      for (const pid of pids) {
+        for (const p of allPortMap.get(pid) ?? []) {
+          if (!excluded.has(p) && !ports.includes(p)) {
+            ports.push(p);
+          }
+        }
+      }
+      const bestPort = selectBestAppPort(ports);
+      if (bestPort !== undefined && !entry.portVerified) {
+        entry.appPort = bestPort;
+        treeProvider?.refresh();
+      }
+      // 达到上限或已权威确认 → 移出轮询池
+      if (entry.portVerified || (entry.pollAttempts ?? 0) >= POLL_MAX_ATTEMPTS) {
+        unregisterPolling(entry);
+      }
+    }
+  } finally {
+    pollRunning = false;
+    // 还有剩余待探测项则按最短间隔继续
+    if (pollPool.size > 0 && pollTimer) {
+      const nextInterval = Math.min(...Array.from(pollPool).map(pollIntervalFor));
+      clearInterval(pollTimer);
+      pollTimer = setInterval(runPolling, Math.max(2000, nextInterval));
+    }
+  }
 }
 
 /** 判断配置类型是否为 Java / Spring Boot 项目 */
@@ -523,10 +633,7 @@ async function stopConfig(
 
   // 2) 断开调试会话并关闭关联终端
   for (const e of entries) {
-    if (e.pollTimer) {
-      clearInterval(e.pollTimer);
-      e.pollTimer = undefined;
-    }
+    unregisterPolling(e);
     try {
       await vscode.debug.stopDebugging(e.session);
     } catch {
@@ -569,6 +676,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(treeView);
 
   let lastUnclaimedTerminal: vscode.Terminal | undefined;
+  treeProvider = provider; // 供模块级共享轮询器刷新树视图
 
   // 记录本插件启动的 session
   context.subscriptions.push(
@@ -596,7 +704,7 @@ export function activate(context: vscode.ExtensionContext) {
       list.push(entry);
       sessionMap.set(name, list);
 
-      // 开启主动轮询：在操作系统层面探测该 session 的 TCP 监听端口
+      // 登记到共享轮询器：在操作系统层面批量探测各 session 的 TCP 监听端口
       // （解决 console: integratedTerminal 时 DAP 收不到日志、端口解析不到的问题）
       const excluded = new Set<number>();
       if (entry.jmx) {
@@ -615,24 +723,9 @@ export function activate(context: vscode.ExtensionContext) {
       if (typeof configObj.jdwpPort === 'number') {
         excluded.add(configObj.jdwpPort);
       }
-
-      let attempts = 0;
-      entry.pollTimer = setInterval(async () => {
-        attempts++;
-        if (entry.portVerified || attempts > 20) {
-          if (entry.pollTimer) {
-            clearInterval(entry.pollTimer);
-            entry.pollTimer = undefined;
-          }
-          return;
-        }
-        const ports = await findListeningPortsForSession(name, entry.terminal, excluded);
-        const bestPort = selectBestAppPort(ports);
-        if (bestPort !== undefined && !entry.portVerified) {
-          entry.appPort = bestPort;
-          provider.refresh();
-        }
-      }, 1500);
+      entry.pollExcluded = excluded;
+      entry.pollAttempts = 0;
+      registerPolling(entry);
 
       provider.refresh();
     })
@@ -686,10 +779,7 @@ export function activate(context: vscode.ExtensionContext) {
                 if (port !== undefined) {
                   entry.appPort = port;
                   entry.portVerified = true;
-                  if (entry.pollTimer) {
-                    clearInterval(entry.pollTimer);
-                    entry.pollTimer = undefined;
-                  }
+                  unregisterPolling(entry);
                   provider.refresh();
                 }
               }
@@ -715,10 +805,7 @@ export function activate(context: vscode.ExtensionContext) {
       const idx = list.findIndex((e) => e.session.id === session.id);
       if (idx >= 0) {
         const [entry] = list.splice(idx, 1);
-        if (entry.pollTimer) {
-          clearInterval(entry.pollTimer);
-          entry.pollTimer = undefined;
-        }
+        unregisterPolling(entry);
         if (list.length === 0) {
           sessionMap.delete(name);
         }
