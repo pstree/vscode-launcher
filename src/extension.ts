@@ -41,10 +41,8 @@ class LaunchItem extends vscode.TreeItem {
     this.checkboxState = checked
       ? vscode.TreeItemCheckboxState.Checked
       : vscode.TreeItemCheckboxState.Unchecked;
-    // 运行中项单击行 → 聚焦该程序的集成终端看日志（勾选框点击不会触发此命令）
-    if (running) {
-      this.command = { command: 'multiLauncher.focusOne', title: '查看终端', arguments: [this] };
-    }
+    // 单击行 → 聚焦该程序的集成终端看日志（运行中 / 未运行 / 启动失败均可；勾选框点击不会触发此命令）
+    this.command = { command: 'multiLauncher.focusOne', title: '查看终端', arguments: [this] };
   }
 }
 
@@ -561,6 +559,7 @@ async function stopConfig(
 export function activate(context: vscode.ExtensionContext) {
   const sessionMap = new Map<string, SessionEntry[]>();
   const unchecked = new Set<string>(); // 默认全选，仅记录用户取消的项
+  const activelyStopping = new Set<string>(); // 记录正在执行主动停止的配置，用于区分「正常停止」与「启动失败」
 
   const provider = new MultiLaunchProvider(sessionMap, unchecked);
   const treeView = vscode.window.createTreeView('multiLauncherView', {
@@ -727,18 +726,22 @@ export function activate(context: vscode.ExtensionContext) {
         // 当调试会话结束（包含从顶部调试工具栏强行停止）时，彻底清理进程和终端
         void (async () => {
           await killProcessByMarker(name);
-          if (entry.terminal) {
-            try {
-              entry.terminal.sendText('\x03', true);
-              entry.terminal.dispose();
-            } catch {}
-          }
-          const terms = findMatchingTerminals(name, lastUnclaimedTerminal);
-          for (const term of terms) {
-            try {
-              term.sendText('\x03', true);
-              term.dispose();
-            } catch {}
+          // 仅「主动停止」时才关闭终端；启动失败（session 自行异常终止）时保留终端，
+          // 方便用户查看失败日志。
+          if (activelyStopping.has(name)) {
+            if (entry.terminal) {
+              try {
+                entry.terminal.sendText('\x03', true);
+                entry.terminal.dispose();
+              } catch {}
+            }
+            const terms = findMatchingTerminals(name, lastUnclaimedTerminal);
+            for (const term of terms) {
+              try {
+                term.sendText('\x03', true);
+                term.dispose();
+              } catch {}
+            }
           }
           provider.refresh();
         })();
@@ -755,32 +758,45 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 单个停止
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiLauncher.stopOne', (item: LaunchItem) => {
-      void stopConfig(item.cfg, sessionMap, lastUnclaimedTerminal);
+    vscode.commands.registerCommand('multiLauncher.stopOne', async (item: LaunchItem) => {
+      activelyStopping.add(item.cfg.name);
+      try {
+        await stopConfig(item.cfg, sessionMap, lastUnclaimedTerminal);
+      } finally {
+        // 延迟移除标记，避免与 onDidTerminateDebugSession 的触发时序竞争
+        setTimeout(() => activelyStopping.delete(item.cfg.name), 2000);
+      }
     })
   );
 
-  // 单击运行中项 → 聚焦该程序的集成终端
+  // 单击任意项（运行中或已停止/启动失败）→ 聚焦该程序的集成终端查看日志
   context.subscriptions.push(
     vscode.commands.registerCommand('multiLauncher.focusOne', async (item: LaunchItem) => {
       const entries = sessionMap.get(item.cfg.name) ?? [];
-      if (entries.length === 0) {
-        return;
-      }
+
+      // 1) 优先用本插件跟踪到的终端（运行中项）
       const entry = entries[entries.length - 1];
-      if (entry.terminal) {
+      if (entry?.terminal) {
         entry.terminal.show();
         return;
       }
+
+      // 2) 未运行（或上次启动失败残留）时，在所有终端里按配置名匹配，
+      //    启动失败的终端仍保留，可据此查看失败日志。
       const terms = findMatchingTerminals(item.cfg.name, lastUnclaimedTerminal);
       if (terms.length > 0) {
-        entry.terminal = terms[0];
-        if (terms[0] === lastUnclaimedTerminal) {
+        const term = terms[0];
+        if (entry) {
+          entry.terminal = term;
+        }
+        if (term === lastUnclaimedTerminal) {
           lastUnclaimedTerminal = undefined;
         }
-        entry.terminal.show();
+        term.show();
         return;
       }
+
+      // 3) 实在没找到终端才提示
       const consoleType = (item.cfg.raw as any).console ?? 'internalConsole';
       await vscode.commands.executeCommand('workbench.debug.action.focusRepl');
       vscode.window.showInformationMessage(
