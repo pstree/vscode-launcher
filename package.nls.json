@@ -1,0 +1,10 @@
+{
+  "displayName": "Multi Launch",
+  "description": "Select multiple launch configurations in the Run & Debug panel and launch them at once; Java configurations automatically get JMX ports injected.",
+  "view.multiLauncherView.name": "Multi Launch",
+  "cmd.launchSelected": "Launch Selected",
+  "cmd.launchOne": "Launch",
+  "cmd.stopOne": "Stop",
+  "cmd.stopAllRunning": "Stop All Running",
+  "cmd.launchAllIdle": "Launch All Not Running"
+}

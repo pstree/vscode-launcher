@@ -1,7 +1,7 @@
 {
   "name": "vscode-launcher",
-  "displayName": "Multi Launch",
-  "description": "在运行和调试面板中多选 launch 配置并同时启动，Java 配置自动注入 JMX 端口",
+  "displayName": "%displayName%",
+  "description": "%description%",
   "version": "0.1.0",
   "engines": {
     "vscode": "^1.84.0"
@@ -16,26 +16,36 @@
       "debug": [
         {
           "id": "multiLauncherView",
-          "name": "多选自启动"
+          "name": "%view.multiLauncherView.name%"
         }
       ]
     },
     "commands": [
       {
         "command": "multiLauncher.launchSelected",
-        "title": "启动选中项",
+        "title": "%cmd.launchSelected%",
         "category": "Multi Launch",
         "icon": "$(play)"
       },
       {
         "command": "multiLauncher.launchOne",
-        "title": "启动",
+        "title": "%cmd.launchOne%",
         "icon": "$(play)"
       },
       {
         "command": "multiLauncher.stopOne",
-        "title": "停止",
+        "title": "%cmd.stopOne%",
         "icon": "$(stop)"
+      },
+      {
+        "command": "multiLauncher.stopAllRunning",
+        "title": "%cmd.stopAllRunning%",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "multiLauncher.launchAllIdle",
+        "title": "%cmd.launchAllIdle%",
+        "icon": "$(play)"
       }
     ],
     "menus": {
@@ -49,13 +59,33 @@
       "view/item/context": [
         {
           "command": "multiLauncher.launchOne",
-          "when": "view == multiLauncherView && viewItem != running",
+          "when": "view == multiLauncherView && viewItem == idle",
           "group": "inline"
         },
         {
           "command": "multiLauncher.stopOne",
           "when": "view == multiLauncherView && viewItem == running",
           "group": "inline"
+        },
+        {
+          "command": "multiLauncher.launchAllIdle",
+          "when": "view == multiLauncherView && viewItem == group-idle",
+          "group": "inline"
+        },
+        {
+          "command": "multiLauncher.launchAllIdle",
+          "when": "view == multiLauncherView && viewItem == group-idle",
+          "group": "2_launch"
+        },
+        {
+          "command": "multiLauncher.stopAllRunning",
+          "when": "view == multiLauncherView && viewItem == group-running",
+          "group": "inline"
+        },
+        {
+          "command": "multiLauncher.stopAllRunning",
+          "when": "view == multiLauncherView && viewItem == group-running",
+          "group": "2_stop"
         }
       ]
     }

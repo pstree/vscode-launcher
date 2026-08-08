@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as net from 'net';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { l10n } from './l10n';
 
 // ---------------------------------------------------------------------------
 // 类型与模型
@@ -18,9 +19,9 @@ interface LaunchConfig {
 /** 分组节点（运行中 / 未运行） */
 class GroupItem extends vscode.TreeItem {
   constructor(public readonly kind: 'running' | 'idle', public readonly count: number) {
-    super(kind === 'running' ? `运行中 (${count})` : `未运行 (${count})`,
+    super(kind === 'running' ? l10n('runningCount', count) : l10n('idleCount', count),
       vscode.TreeItemCollapsibleState.Expanded);
-    this.contextValue = 'group';
+    this.contextValue = kind === 'running' ? 'group-running' : 'group-idle';
     this.iconPath = new vscode.ThemeIcon(kind === 'running' ? 'circle-filled' : 'circle-outline');
   }
 }
@@ -42,7 +43,7 @@ class LaunchItem extends vscode.TreeItem {
       ? vscode.TreeItemCheckboxState.Checked
       : vscode.TreeItemCheckboxState.Unchecked;
     // 单击行 → 聚焦该程序的集成终端看日志（运行中 / 未运行 / 启动失败均可；勾选框点击不会触发此命令）
-    this.command = { command: 'multiLauncher.focusOne', title: '查看终端', arguments: [this] };
+    this.command = { command: 'multiLauncher.focusOne', title: l10n('focusTerminal'), arguments: [this] };
   }
 }
 
@@ -906,8 +907,7 @@ export function activate(context: vscode.ExtensionContext) {
       const consoleType = (item.cfg.raw as any).console ?? 'internalConsole';
       await vscode.commands.executeCommand('workbench.debug.action.focusRepl');
       vscode.window.showInformationMessage(
-        `「${item.cfg.name}」未关联集成终端（当前 console="${consoleType}"）。` +
-          `如需在终端查看启动日志，请在其 launch 配置中加入 "console": "integratedTerminal"，然后重新启动。`
+        l10n('notLinkedTerminal', item.cfg.name, consoleType) + ' ' + l10n('howToLinkTerminal')
       );
     })
   );
@@ -926,21 +926,68 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 多选启动：启动所有被勾选的项
+  // 启动所有未运行且被勾选的配置（「全部运行」）
+  const launchAllIdle = async (): Promise<void> => {
+    const all = readAllConfigs();
+    const targets = all.filter(
+      (c) => !unchecked.has(c.name) && (sessionMap.get(c.name) ?? []).length === 0
+    );
+    if (targets.length === 0) {
+      vscode.window.showInformationMessage(l10n('allRunning'));
+      return;
+    }
+    const used = new Set<number>();
+    for (const cfg of targets) {
+      await launchConfig(cfg, used);
+    }
+  };
+
+  // 多选启动：启动所有被勾选的项（视图标题栏「全部运行」）
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiLauncher.launchSelected', async () => {
-      const all = readAllConfigs();
-      const targets = all.filter(
-        (c) => !unchecked.has(c.name) && (sessionMap.get(c.name) ?? []).length === 0
-      );
-      if (targets.length === 0) {
-        vscode.window.showInformationMessage('勾选的配置均已运行，无需重复启动。');
+    vscode.commands.registerCommand('multiLauncher.launchSelected', launchAllIdle)
+  );
+
+  // 未运行分组「运行全部」：启动该分组下所有未运行的配置
+  context.subscriptions.push(
+    vscode.commands.registerCommand('multiLauncher.launchAllIdle', launchAllIdle)
+  );
+
+  // 停止全部：停止「运行中」分组下的所有程序
+  context.subscriptions.push(
+    vscode.commands.registerCommand('multiLauncher.stopAllRunning', async () => {
+      // 收集所有正在运行的配置名（stopConfig 会修改 sessionMap，需先快照）
+      const runningNames: string[] = [];
+      for (const [name, entries] of sessionMap) {
+        if (entries.length > 0) {
+          runningNames.push(name);
+        }
+      }
+      if (runningNames.length === 0) {
+        vscode.window.showInformationMessage(l10n('nothingRunning'));
         return;
       }
-      const used = new Set<number>();
-      for (const cfg of targets) {
-        await launchConfig(cfg, used);
+      const allCfgs = readAllConfigs();
+      for (const name of runningNames) {
+        const cfg = allCfgs.find((c) => c.name === name);
+        if (!cfg) {
+          // 配置可能已从 launch.json 移除，但仍需清理残留 session
+          for (const e of sessionMap.get(name) ?? []) {
+            unregisterPolling(e);
+            try {
+              await vscode.debug.stopDebugging(e.session);
+            } catch {}
+          }
+          sessionMap.delete(name);
+          continue;
+        }
+        activelyStopping.add(name);
+        try {
+          await stopConfig(cfg, sessionMap, lastUnclaimedTerminal);
+        } finally {
+          setTimeout(() => activelyStopping.delete(name), 2000);
+        }
       }
+      provider.refresh();
     })
   );
 }

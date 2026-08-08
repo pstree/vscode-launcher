@@ -1,0 +1,10 @@
+{
+  "displayName": "Multi Launch",
+  "description": "在运行和调试面板中多选 launch 配置并同时启动，Java 配置自动注入 JMX 端口",
+  "view.multiLauncherView.name": "多选自启动",
+  "cmd.launchSelected": "启动选中项",
+  "cmd.launchOne": "启动",
+  "cmd.stopOne": "停止",
+  "cmd.stopAllRunning": "停止全部",
+  "cmd.launchAllIdle": "运行全部未运行项"
+}
