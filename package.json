@@ -12,6 +12,19 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "Multi Launch",
+      "properties": {
+        "multiLauncher.portPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional regex patterns to detect application ports from debug output (case-insensitive)."
+        }
+      }
+    },
     "views": {
       "debug": [
         {

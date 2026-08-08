@@ -774,7 +774,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // 通过 Debug Adapter Tracker 拦截 DAP output 事件，解析程序端口
-  const patterns = getPortPatterns();
+  let patterns = getPortPatterns();
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterTrackerFactory('*', {
       createDebugAdapterTracker(session: vscode.DebugSession) {
@@ -807,6 +807,15 @@ export function activate(context: vscode.ExtensionContext) {
           },
         };
       },
+    })
+  );
+
+  // 监听配置变更，动态更新端口模式
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('multiLauncher.portPatterns')) {
+        patterns = getPortPatterns();
+      }
     })
   );
 
@@ -992,5 +1001,12 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-export function deactivate() {}
+export function deactivate() {
+  // 清理轮询定时器
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = undefined;
+  }
+  pollPool.clear();
+}
 
