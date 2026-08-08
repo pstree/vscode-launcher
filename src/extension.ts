@@ -808,9 +808,11 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('multiLauncher.launchSelected', async () => {
       const all = readAllConfigs();
-      const targets = all.filter((c) => !unchecked.has(c.name));
+      const targets = all.filter(
+        (c) => !unchecked.has(c.name) && (sessionMap.get(c.name) ?? []).length === 0
+      );
       if (targets.length === 0) {
-        vscode.window.showInformationMessage('请先在列表中勾选要启动的配置。');
+        vscode.window.showInformationMessage('勾选的配置均已运行，无需重复启动。');
         return;
       }
       const used = new Set<number>();
