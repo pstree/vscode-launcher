@@ -257,16 +257,35 @@ async function getListeningPortsForPids(
       } catch {}
     }
     if (result.size === 0 && process.platform === 'linux') {
+      // 兜底：lsof 缺失或解析失败时，用 ss -tlnp 获取监听端口。
+      // 由于此前逐 PID lsof 已失败，此处在未知进程归属的情况下，
+      // 直接收集所有监听端口并尝试关联到当前 session 的 PID。
       try {
         const { stdout } = await promisify(exec)(`ss -tlnp 2>/dev/null`);
         const lines = stdout.split(/[\r\n]+/);
-        for (const pid of uniquePids) {
-          for (const line of lines) {
-            if (line.includes(`pid=${pid},`)) {
-              const match = /:(\d+)\s+/.exec(line);
-              if (match && match[1]) {
-                add(pid, parseInt(match[1], 10));
-              }
+        for (const line of lines) {
+          // ss 进程信息格式多样（如 pid=123、pid=123,、user=...,pid=123,fd=...），
+          // 用正则提取行内所有 pid=，而非依赖固定逗号分隔。
+          const pidMatches = Array.from(line.matchAll(/pid=(\d+)/g));
+          if (pidMatches.length === 0) {
+            continue;
+          }
+          // 解析监听端口：ss -tln 列序为 Recv-Q Send-Q Local Foreign State Process，
+          // Local Address:Port 形态多样（127.0.0.1:8080 / 0.0.0.0:8080 / *:8080 / [::]:8080），
+          // 用「]或数字或*」后跟「:端口」来匹配本地端口；Peer 列常为 *:* 或 0.0.0.0:*，
+          // 不会因数字端口而干扰。
+          const portMatch = /(?:\]|[0-9]|\*):(\d{1,5})\b/.exec(line);
+          if (!portMatch || !portMatch[1]) {
+            continue;
+          }
+          const localPort = parseInt(portMatch[1], 10);
+          if (isNaN(localPort) || localPort <= 0 || localPort >= 65536) {
+            continue;
+          }
+          for (const pm of pidMatches) {
+            const pid = parseInt(pm[1], 10);
+            if (!isNaN(pid) && pid > 0) {
+              add(pid, localPort);
             }
           }
         }
