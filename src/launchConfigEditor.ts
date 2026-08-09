@@ -752,8 +752,8 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
     <div class="sidebar">
       <div class="sidebar-header">
         <span>启动配置</span>
-        <button class="add-btn" id="addEnvFileBtn" title="为所有启动项添加 envFile" style="margin-right:4px;">批量添加envFile</button>
-        <button class="add-btn" id="addConfigBtn" title="扫描项目并自动添加启动配置">一键新增</button>
+        <button class="add-btn" id="addConfigBtn" title="扫描项目并自动添加启动配置" style="margin-right:4px;">一键新增</button>
+        <button class="add-btn" id="addEnvFileBtn" title="为所有启动项添加 envFile">批量添加envFile</button>
       </div>
       <div class="config-list" id="configList">
         <div class="empty-list">加载中...</div>
