@@ -28,9 +28,6 @@ jobs:
       - name: Package VSIX
         run: npx @vscode/vsce package --allow-missing-repository
 
-      - name: Rename VSIX to fixed name
-        run: mv *.vsix vscode-launcher.vsix
-
       - name: Create or update first release
         uses: softprops/action-gh-release@v2
         with:
@@ -40,7 +37,7 @@ jobs:
             ## Multi Launch
 
             Auto-packaged from the latest push.
-          files: vscode-launcher.vsix
+          files: *.vsix
           draft: false
           prerelease: false
           make_latest: true
