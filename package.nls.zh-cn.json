@@ -6,5 +6,6 @@
   "cmd.launchOne": "启动",
   "cmd.stopOne": "停止",
   "cmd.stopAllRunning": "停止全部",
+  "cmd.configureLaunch": "配置启动项",
   "cmd.launchAllIdle": "运行全部未运行项"
 }

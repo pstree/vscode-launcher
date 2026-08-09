@@ -3,6 +3,7 @@ import * as net from 'net';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { l10n } from './l10n';
+import { LaunchConfigEditor } from './launchConfigEditor';
 
 // ---------------------------------------------------------------------------
 // 类型与模型
@@ -961,9 +962,15 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('multiLauncher.launchAllIdle', launchAllIdle)
   );
 
-  // 停止全部：停止「运行中」分组下的所有程序
-  context.subscriptions.push(
-    vscode.commands.registerCommand('multiLauncher.stopAllRunning', async () => {
+  // 配置启动项：打开图形化配置编辑器
+	  const configEditor = new LaunchConfigEditor(context);
+	  context.subscriptions.push(
+	    vscode.commands.registerCommand('multiLauncher.configureLaunch', () => configEditor.show())
+	  );
+
+	  // 停止全部：停止「运行中」分组下的所有程序
+	  context.subscriptions.push(
+	    vscode.commands.registerCommand('multiLauncher.stopAllRunning', async () => {
       // 收集所有正在运行的配置名（stopConfig 会修改 sessionMap，需先快照）
       const runningNames: string[] = [];
       for (const [name, entries] of sessionMap) {

@@ -6,5 +6,6 @@
   "cmd.launchOne": "Launch",
   "cmd.stopOne": "Stop",
   "cmd.stopAllRunning": "Stop All Running",
+  "cmd.configureLaunch": "Configure Launch",
   "cmd.launchAllIdle": "Launch All Not Running"
 }

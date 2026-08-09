@@ -35,6 +35,12 @@
     },
     "commands": [
       {
+        "command": "multiLauncher.configureLaunch",
+        "title": "%cmd.configureLaunch%",
+        "category": "Multi Launch",
+        "icon": "$(gear)"
+      },
+      {
         "command": "multiLauncher.launchSelected",
         "title": "%cmd.launchSelected%",
         "category": "Multi Launch",
@@ -64,9 +70,14 @@
     "menus": {
       "view/title": [
         {
+          "command": "multiLauncher.configureLaunch",
+          "when": "view == multiLauncherView",
+          "group": "navigation@0"
+        },
+        {
           "command": "multiLauncher.launchSelected",
           "when": "view == multiLauncherView",
-          "group": "navigation"
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
