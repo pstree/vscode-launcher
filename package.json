@@ -1,5 +1,6 @@
 {
   "name": "vscode-launcher",
+  "publisher": "qian",
   "displayName": "%displayName%",
   "description": "%description%",
   "version": "0.1.0",
