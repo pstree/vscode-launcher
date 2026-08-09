@@ -603,7 +603,8 @@ function findMatchingTerminals(configName: string, unclaimedTerminal?: vscode.Te
     }
   }
 
-  if (matched.length === 0 && unclaimedTerminal && !unclaimedTerminal.exitStatus) {
+  // 回退到未认领的终端（即使已退出也保留，方便查看失败日志）
+  if (matched.length === 0 && unclaimedTerminal) {
     matched.push(unclaimedTerminal);
   }
 
@@ -618,6 +619,8 @@ async function launchConfig(cfg: LaunchConfig, used: Set<number>): Promise<void>
   if (isJavaConfig(cfg.type)) {
     const { jmx, rmi } = await allocPorts(cfg.name, used);
     resolved.vmArgs = mergeVmArgs(cfg.raw.vmArgs, `${buildJmxArgs(jmx, rmi)} ${marker}`);
+    // Java 程序强制使用集成终端：确保启动日志可见、端口轮询正常、失败时可查看日志
+    resolved.console = 'integratedTerminal';
     (resolved as any)[LAUNCHED_BY_US] = true;
     (resolved as any).__jmx = jmx;
     (resolved as any).__rmi = rmi;
@@ -697,6 +700,8 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(treeView);
 
   let lastUnclaimedTerminal: vscode.Terminal | undefined;
+  // 保存每个配置名最后一次关联的终端（即使 session 结束后仍可查找，方便查看失败日志）
+  const lastTerminalForName = new Map<string, vscode.Terminal>();
   treeProvider = provider; // 供模块级共享轮询器刷新树视图
 
   // 记录本插件启动的 session
@@ -720,6 +725,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (terms[0] === lastUnclaimedTerminal) {
           lastUnclaimedTerminal = undefined;
         }
+        lastTerminalForName.set(name, terms[0]);
       }
 
       list.push(entry);
@@ -755,22 +761,44 @@ export function activate(context: vscode.ExtensionContext) {
   // 将本插件起的 session 关联其集成终端
   context.subscriptions.push(
     vscode.window.onDidOpenTerminal((terminal) => {
+      const tName = terminal.name.toLowerCase();
       let claimedEntry: SessionEntry | undefined;
+      let claimedName: string | undefined;
+
+      // 1) 优先匹配正在运行的 session（取最长匹配，避免短名误匹配）
+      let bestLen = 0;
       for (const [name, entries] of sessionMap) {
         const target = name.toLowerCase();
-        const tName = terminal.name.toLowerCase();
-        if (tName.includes(target) || target.includes(tName)) {
+        if ((tName.includes(target) || target.includes(tName)) && name.length > bestLen) {
           const entry = entries.find((e) => !e.terminal);
-          if (entry && !claimedEntry) {
+          if (entry) {
             claimedEntry = entry;
+            claimedName = name;
+            bestLen = name.length;
           }
         }
       }
-      if (claimedEntry) {
+      if (claimedEntry && claimedName) {
         claimedEntry.terminal = terminal;
-      } else {
-        lastUnclaimedTerminal = terminal;
+        lastTerminalForName.set(claimedName, terminal);
+        return;
       }
+
+      // 2) session 可能尚未开始或已结束，按所有配置名匹配（取最长匹配）
+      const allCfgs = readAllConfigs();
+      let bestMatch: string | undefined;
+      for (const cfg of allCfgs) {
+        const target = cfg.name.toLowerCase();
+        if ((tName.includes(target) || target.includes(tName)) && cfg.name.length > (bestMatch?.length ?? 0)) {
+          bestMatch = cfg.name;
+        }
+      }
+      if (bestMatch) {
+        lastTerminalForName.set(bestMatch, terminal);
+      }
+
+      // 3) 始终存为 lastUnclaimedTerminal，供 onDidStartDebugSession 的 findMatchingTerminals 使用
+      lastUnclaimedTerminal = terminal;
     })
   );
 
@@ -811,11 +839,14 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 监听配置变更，动态更新端口模式
+  // 监听配置变更，动态更新端口模式 + 刷新树视图
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('multiLauncher.portPatterns')) {
         patterns = getPortPatterns();
+      }
+      if (e.affectsConfiguration('launch')) {
+        provider.refresh();
       }
     })
   );
@@ -858,6 +889,12 @@ export function activate(context: vscode.ExtensionContext) {
                 term.sendText('\x03', true);
                 term.dispose();
               } catch {}
+            }
+            lastTerminalForName.delete(name);
+          } else {
+            // 非主动停止（启动失败等）：保留终端引用，方便用户点击查看失败日志
+            if (entry.terminal) {
+              lastTerminalForName.set(name, entry.terminal);
             }
           }
           provider.refresh();
@@ -913,7 +950,19 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      // 3) 实在没找到终端才提示
+      // 3) 回退：使用 lastTerminalForName 中保存的终端引用（session 结束后仍保留）
+      const lastTerm = lastTerminalForName.get(item.cfg.name);
+      if (lastTerm) {
+        try {
+          lastTerm.show();
+          return;
+        } catch {
+          // 终端可能已关闭，清理引用
+          lastTerminalForName.delete(item.cfg.name);
+        }
+      }
+
+      // 4) 实在没找到终端才提示
       const consoleType = (item.cfg.raw as any).console ?? 'internalConsole';
       await vscode.commands.executeCommand('workbench.debug.action.focusRepl');
       vscode.window.showInformationMessage(

@@ -91,13 +91,22 @@ function readAllLaunchConfigs(): LaunchConfigInfo[] {
   return result;
 }
 
-/** 写入 launch.json：先直接写文件，再同步 VS Code 内存配置 */
+/** 写入 launch.json：直接覆盖文件（丢弃编辑器中未保存的更改） */
 async function writeLaunchJson(folderIndex: number, configs: any[]): Promise<void> {
   const folders = vscode.workspace.workspaceFolders;
   const folder = (folderIndex >= 0 && folders) ? folders[folderIndex] : undefined;
   const uri = getLaunchUri(folder);
 
-  // 1. 直接写文件
+  // 1. 如果 launch.json 在编辑器中打开且有未保存更改，先还原（丢弃更改）以避免写入冲突
+  for (const doc of vscode.workspace.textDocuments) {
+    if (doc.uri.toString() === uri.toString() && doc.isDirty) {
+      await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true });
+      await vscode.commands.executeCommand('workbench.action.files.revert');
+      break;
+    }
+  }
+
+  // 2. 直接写文件（覆盖）
   let doc: any = { version: '0.2.0', configurations: configs };
   try {
     const raw = await vscode.workspace.fs.readFile(uri);
@@ -108,15 +117,6 @@ async function writeLaunchJson(folderIndex: number, configs: any[]): Promise<voi
   }
   const content = JSON.stringify(doc, null, 2) + '\n';
   await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
-
-  // 2. 同步 VS Code 内存中的配置
-  const target = folder
-    ? vscode.ConfigurationTarget.WorkspaceFolder
-    : vscode.ConfigurationTarget.Workspace;
-  const launchConfig = folder
-    ? vscode.workspace.getConfiguration('launch', folder)
-    : vscode.workspace.getConfiguration('launch');
-  await launchConfig.update('configurations', configs, target);
 }
 
 function configToParams(raw: Record<string, any>): EditableParam[] {
@@ -724,6 +724,26 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
     }
     .toast.show { opacity: 1; transform: translateY(0); }
     .toast.error { border-color: var(--danger); }
+
+    /* loading 状态 */
+    .loading-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    button.loading { pointer-events: none; opacity: 0.6; }
+    .global-loading {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: transparent;
+      z-index: 200;
+      cursor: wait;
+    }
   </style>
 </head>
 <body>
@@ -764,6 +784,40 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
     let currentParams = [];     // 当前显示的参数（来自文件或上次保存）
     let dirty = false;          // 是否有未保存的修改
     let expandedConfigs = {};   // 左侧展开状态：key = folderIndex:configIndex
+    let loadingAction = null;   // 当前正在进行的操作：'delete' | 'save' | 'addConfig' | 'addEnvFile' | null
+
+    // ===== Loading 控制 =====
+    function startLoading(action, btnEl) {
+      loadingAction = action;
+      if (btnEl) {
+        btnEl.classList.add('loading');
+        const orig = btnEl.innerHTML;
+        btnEl.dataset.origHtml = orig;
+        btnEl.innerHTML = '<span class="loading-spinner"></span>';
+      }
+      // 全局遮罩，阻止重复点击
+      let overlay = document.getElementById('globalLoadingOverlay');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'globalLoadingOverlay';
+        overlay.className = 'global-loading';
+        document.body.appendChild(overlay);
+      }
+    }
+
+    function endLoading() {
+      loadingAction = null;
+      // 恢复所有 loading 按钮
+      document.querySelectorAll('button.loading').forEach(btn => {
+        btn.classList.remove('loading');
+        if (btn.dataset.origHtml) {
+          btn.innerHTML = btn.dataset.origHtml;
+          delete btn.dataset.origHtml;
+        }
+      });
+      const overlay = document.getElementById('globalLoadingOverlay');
+      if (overlay) overlay.remove();
+    }
 
     // ===== DOM 引用 =====
     const $ = (id) => document.getElementById(id);
@@ -1158,10 +1212,12 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
 
     // ===== 保存 =====
     function doSave() {
+      if (loadingAction) return;
       const raw = {};
       for (const p of currentParams) {
         raw[p.key] = p.value;
       }
+      startLoading('save', $('saveBtn'));
       vscode.postMessage({
         type: 'saveConfig',
         configIndex: selectedConfigIndex,
@@ -1202,6 +1258,8 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
           break;
         case 'delete-config':
           e.stopPropagation();
+          if (loadingAction) return;
+          startLoading('delete', target);
           vscode.postMessage({ type: 'deleteConfig', configIndex: index, folderIndex: folder });
           break;
       }
@@ -1273,10 +1331,14 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
     });
 
     document.getElementById('addConfigBtn').addEventListener('click', () => {
+      if (loadingAction) return;
+      startLoading('addConfig', $('addConfigBtn'));
       vscode.postMessage({ type: 'addConfig' });
     });
 
     document.getElementById('addEnvFileBtn').addEventListener('click', () => {
+      if (loadingAction) return;
+      startLoading('addEnvFile', $('addEnvFileBtn'));
       vscode.postMessage({ type: 'addEnvFileToAll' });
     });
 
@@ -1287,19 +1349,24 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
         case 'configList':
           configs = msg.configs;
           renderConfigList();
+          // addConfig 完成后 configList 会到达
+          if (loadingAction === 'addConfig') {
+            endLoading();
+          }
           break;
         case 'configDetail':
           renderParams(msg.params);
           break;
         case 'saved':
+          endLoading();
           markClean();
           showToast('已保存');
-          // 刷新左侧列表以显示最新的参数
-          vscode.postMessage({ type: 'ready' });
+          // configList 消息已包含最新数据，无需再发 ready 触发可能读到旧数据的 refreshConfigList
           break;
         case 'envFileAdded':
+          endLoading();
           showToast('已为所有启动项添加 envFile');
-          vscode.postMessage({ type: 'ready' });
+          // configList 消息已包含最新数据，无需再发 ready
           // 刷新右侧面板（如果已选中配置）
           if (selectedFolderIndex >= 0 && selectedConfigIndex >= 0) {
             vscode.postMessage({
@@ -1310,6 +1377,7 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
           }
           break;
         case 'configDeleted':
+          endLoading();
           // 如果删除的是当前选中的配置，清空右侧面板
           if (selectedFolderIndex === msg.folderIndex && selectedConfigIndex === msg.configIndex) {
             selectedFolderIndex = -1;
