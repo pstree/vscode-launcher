@@ -1,63 +1,86 @@
 # Multi Launch
 
-一个 VS Code 扩展，让你在「运行和调试」面板中**多选** `launch.json` 里的配置并**一键同时启动**。Java 类型的配置会自动注入 JMX 远程端口（随机分配、互不冲突），并在运行中显示程序自身的监听端口（如 Spring Boot 的 Tomcat 端口）。
+A VS Code extension that lets you **multi-select** launch configurations from `launch.json` in the **Run & Debug** view and **launch them all at once**. Java configurations automatically get JMX remote ports injected (randomly allocated, conflict-free), and the applications' own listening ports (e.g. the Spring Boot Tomcat port) are shown while they run.
 
-## 功能
+## Features
 
-- **常驻多选视图**：在「运行和调试」面板下新增「多选自启动」视图，平铺列出 `launch.json` 的全部顶层配置，默认全部可见。
-- **分组展示**：视图分为「运行中」与「未运行」两个分组，已启动的项归入「运行中」分组，状态一目了然。
-- **自由多选**：支持 `Ctrl` 点选、`Shift` 范围多选（TreeView 原生多选）。
-- **一键批量启动**：选中多个配置后，点击标题栏的「启动选中项」即可同时启动。
-- **逐项 inline 操作**：每个配置项自带 `[▶ 启动]` / `[■ 停止]` 按钮，可单独启停。
-- **单击定位输出**：单击运行中项可聚焦其调试控制台，查看该程序输出。
-- **Java 自动注入 JMX**：类型为 `java` 的配置启动时自动追加 JMX 远程 `vmArgs`，端口随机分配且同批次不冲突；非 Java 配置原样启动。
-- **程序端口显示**：运行中项后面显示程序自身监听的端口（如 `:8080`）；抓不到则不显示（绝不编造）。JMX 调试端口不在视图显示。
-- **不改磁盘**：所有注入都发生在内存中的启动配置副本上，`launch.json` 文件保持原样。
+- **Persistent multi-select view**: Adds a "Multi Launch" view under the **Run & Debug** sidebar that lists every top-level configuration from `launch.json`, all visible by default.
+- **Grouped display**: The view is split into a **Running** group and a **Not running** group. Started items move to the Running group, so status is always clear at a glance.
+- **Free multi-selection**: Native TreeView checkboxes — tick the boxes you want, all others stay untouched.
+- **Batch launch in one click**: After selecting configurations, click **Launch Selected** in the view title bar to start them all simultaneously.
+- **Per-item inline actions**: Each configuration has a `[▶ Launch]` / `[■ Stop]` inline button for individual start/stop.
+- **Click to focus output**: Clicking a running item focuses its integrated terminal so you can read that program's output.
+- **Java JMX auto-injection**: When a configuration of type `java` starts, JMX remote `vmArgs` are appended automatically with randomly allocated, batch-conflict-free ports. Non-Java configurations launch unchanged.
+- **Application port display**: A running item shows the application's own listening port (e.g. `:8080`); if it can't be detected, nothing is shown (never faked). The JMX debug port is not shown in the view.
+- **Disk-unchanged**: All injection happens on an in-memory copy of the launch configuration, so your `launch.json` file stays exactly as you wrote it.
+- **Graphical launch config editor**: The **Configure Launch** command (`multiLauncher.configureLaunch`) opens a webview editor where you can:
+  - Browse every configuration with its parameters.
+  - Edit any parameter (string / number / boolean / array / object), add or remove parameters, and save directly back to `launch.json`.
+  - **Auto-scan the project** ("一键新增" / *Scan & Add*) to detect launchable entries for **Node.js** (`package.json` `main` and `start`/`dev`/`serve` scripts), **Python** (entry files like `main.py`, `app.py`, …), and **Java** (classes with a `main` method), then append them automatically.
+  - **Batch-add `envFile`** to every configuration at once.
+  - Delete configurations.
+- **Accurate OS-level port detection**: For Java launches using the integrated terminal, the app port is detected by probing the actual OS listening sockets of the launched process (via `Get-NetTCPConnection` / `lsof` / `ss`), correctly attributed per process and excluding debug/JMX ports.
+- **Robust stop**: Stopping a configuration kills the process at the OS level by a unique marker, disconnects the debug session, and closes the associated terminal. Failed starts keep their terminal open so you can inspect the error log.
 
-## 安装与运行（开发）
+## Install & Run (Development)
 
 ```bash
 npm install
 
-# 或 npm run watch 持续编译
+# or npm run watch for continuous compile
 npm run compile
 npx @vscode/vsce package --allow-missing-repository
 ```
 
-按 `F5` 在扩展开发宿主中调试。
+Press `F5` to debug in the Extension Development Host.
 
-## 使用
+## Usage
 
-1. 打开一个含 `launch.json` 的工作区。
-2. 在侧边栏「运行和调试」中找到「多选自启动」视图。
-3. `Ctrl` / `Shift` 选中若干配置，点击标题栏 ▶「启动选中项」；或点击某项右侧的 `▶` 单独启动。
-4. 运行中项显示 `●` 及程序端口（如 `:8080`），点击 `■` 停止。
+1. Open a workspace that contains a `launch.json`.
+2. In the **Run & Debug** sidebar, find the **Multi Launch** view.
+3. Tick the checkboxes for the configurations you want, then click the title bar's ▶ **Launch Selected**; or click the `▶` inline button on an item to start it individually.
+4. Running items show `●` plus the application port (e.g. `:8080`). Click `■` to stop.
+5. Click **Configure Launch** (gear icon) in the view title bar to open the graphical editor for adding, editing, or scanning configurations.
 
-> 注意：只有经本扩展启动的 session 才会出现在「运行中」分组并被「停止」管理。从原生「运行和调试」面板手动启动的同名配置不会被本扩展接管。
+> **Note**: Only sessions started by this extension appear in the **Running** group and are managed by **Stop**. Configurations you start manually from the native Run & Debug panel are not taken over by this extension.
 
-## 配置项
+## Settings
 
-在设置中可调整：
+Available in settings:
 
-| 设置 | 说明 | 默认 |
+| Setting | Description | Default |
 | --- | --- | --- |
-| `multiLauncher.portPatterns` | 用于从程序输出中解析端口的正则表达式字符串数组（附加在默认规则之后） | `[]` |
+| `multiLauncher.portPatterns` | Array of regex strings used to parse application ports from debug output (appended after the built-in rules) | `[]` |
 
-默认端口解析规则（按序匹配第一个命中）：
+Built-in port parsing rules (matched in order, first hit wins):
 
-- `Tomcat started on port(s): <port>`（Spring Boot）
+- `Tomcat started on port(s): <port>` (Spring Boot)
+- `Tomcat initialized with port(s): <port>`
+- `(Netty|Undertow|Jetty|WebServer) started on port(s): <port>`
 - `Started ... on port(s) <port>`
-- `Listening on ... <port>` / `server ... port ... <port>`（通用兜底）
+- `Listening on ... <port>` / `Server started on ... <port>` / `App running on ... <port>`
+- `Local: http://...:<port>` / `Network: http://...:<port>`
+- Generic fallback: `started on port ... <port>` / `port: <port>` / `port=<port>`
 
-## 端口分配规则（Java）
+## Port Allocation Rules (Java)
 
-- 基址 `base = 61000 + (hash(配置名) % 4000)`，落在 `61000–64999`。
-- `jmx = base`，`rmi = base + 1`。
-- 同一次批量启动内若与其他配置冲突，或端口已被本机占用，则 `base += 2` 重试，直到空闲。
-- 同名配置重启时 `hash` 稳定，端口保持一致；同批次多选时允许偏移避让以保证不冲突。
-- 不做跨会话持久化（每次启动重新探测）。
+- Base address: `base = 61000 + (hash(configName) % 4000)`, landing in `61000–64999`.
+- `jmx = base`, `rmi = base + 1`.
+- If a conflict occurs with another configuration in the same batch launch, or the port is already taken locally, `base += 2` and retry until a free pair is found.
+- The `hash` is stable for a given config name, so restarts keep the same port; within a multi-select batch, offsets are applied to avoid conflicts.
+- No cross-session persistence — ports are re-probed on every launch.
 
-## 适用范围
+## Application Port Detection
 
-- 仅支持 `launch.json` 的**顶层** `configurations`，不支持 `compounds`（组合配置）。
-- 需要 VS Code `>= 1.84`（TreeView `multiSelect` 所需）。
+When a Java configuration launches in the integrated terminal, the Debug Adapter Protocol may not relay the program's stdout, so ports can't be parsed from logs alone. The extension instead:
+
+1. Detects the launched process and its child processes via a unique marker (`-DmultiLauncher.id=...`).
+2. Queries the OS for TCP **LISTEN** sockets owned by those PIDs (`Get-NetTCPConnection` on Windows; `lsof`/`ss` on macOS/Linux).
+3. Excludes known debug/JMX ports and any JDWP port found in the process command line, then picks the best candidate (preferring standard ports `< 32768`).
+
+If a port is detected in the logs via the DAP tracker, that takes precedence and OS polling stops.
+
+## Scope & Requirements
+
+- Only **top-level** `configurations` in `launch.json` are supported; `compounds` (compound configurations) are not.
+- Requires VS Code `>= 1.84` (needed for TreeView multi-select and checkboxes).
