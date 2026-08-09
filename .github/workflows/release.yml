@@ -2,8 +2,6 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
 
 jobs:
   release:
@@ -30,19 +28,19 @@ jobs:
       - name: Package VSIX
         run: npx @vscode/vsce package --allow-missing-repository
 
-      - name: Set release tag
-        id: tag
-        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - name: Rename VSIX to fixed name
+        run: mv *.vsix vscode-launcher.vsix
 
-      - name: Create Release and upload asset
+      - name: Create or update first release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.TAG }}
-          name: ${{ steps.tag.outputs.TAG }}
+          tag_name: v1.0.0
+          name: Multi Launch
           body: |
-            ## Multi Launch ${{ steps.tag.outputs.TAG }}
+            ## Multi Launch
 
-            Auto-generated release from tag `${{ steps.tag.outputs.TAG }}`.
-          files: '*.vsix'
+            Auto-packaged from the latest push.
+          files: vscode-launcher.vsix
           draft: false
           prerelease: false
+          make_latest: true
