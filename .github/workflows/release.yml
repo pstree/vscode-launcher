@@ -37,7 +37,8 @@ jobs:
             ## Multi Launch
 
             Auto-packaged from the latest push.
-          files: *.vsix
+          files: |
+            *.vsix
           draft: false
           prerelease: false
           make_latest: true
