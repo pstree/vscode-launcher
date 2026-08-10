@@ -225,13 +225,13 @@ async function scanProjectForLaunchConfigs(): Promise<ScannedConfig[]> {
           if (scriptName === 'start' || scriptName === 'serve' || scriptName.endsWith('dev')) {
             results.push({
               name: `${label}npm: ${scriptName}`,
-              type: 'node',
+              type: 'node-terminal',
               raw: {
-                type: 'node',
+                type: 'node-terminal',
                 request: 'launch',
                 name: `${label}npm: ${scriptName}`,
-                runtimeExecutable: 'npm',
-                runtimeArgs: ['run', scriptName],
+                // 在集成终端执行，自动继承 shell（nvm）环境，无需额外配置 npm/node 路径
+                command: `npm run ${scriptName}`,
                 cwd: projectDir,
               },
             });
