@@ -1,5 +1,5 @@
 {
-  "displayName": "Multi Launch",
+  "displayName": "vscode-launcher",
   "description": "在运行和调试面板中多选 launch 配置并同时启动，Java 配置自动注入 JMX 端口",
   "view.multiLauncherView.name": "多选自启动",
   "cmd.launchSelected": "启动选中项",
