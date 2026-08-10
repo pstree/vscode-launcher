@@ -363,8 +363,8 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
 
     /* ===== 左侧边栏 ===== */
     .sidebar {
-      width: 300px;
-      min-width: 200px;
+      width: 50%;
+      min-width: 300px;
       background: var(--sidebar-bg);
       border-right: 1px solid var(--border);
       display: flex;
