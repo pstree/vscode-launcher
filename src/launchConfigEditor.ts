@@ -234,7 +234,7 @@ async function scanProjectForLaunchConfigs(): Promise<ScannedConfig[]> {
                   request: 'launch',
                   name: `${label}npm: ${scriptName}`,
                   // 在集成终端执行，自动继承 shell（nvm）环境，无需额外配置 npm/node 路径
-                  command: `npm run ${scriptName}`,
+                  command: `nvm use && npm run ${scriptName}`,
                   cwd: projectDir,
                 },
               });
