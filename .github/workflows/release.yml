@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -34,8 +37,6 @@ jobs:
           tag_name: v1.0.0
           name: Multi Launch
           body: |
-            ## Multi Launch
-
             Auto-packaged from the latest push.
           files: |
             *.vsix
