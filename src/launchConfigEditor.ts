@@ -1367,8 +1367,6 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
     });
 
     document.getElementById('addConfigBtn').addEventListener('click', () => {
-      if (loadingAction) return;
-      startLoading('addConfig', $('addConfigBtn'));
       vscode.postMessage({ type: 'addConfig' });
     });
 
@@ -1385,10 +1383,6 @@ function getWebviewContent(webview: vscode.Webview, extensionUri: vscode.Uri): s
         case 'configList':
           configs = msg.configs;
           renderConfigList();
-          // addConfig 完成后 configList 会到达
-          if (loadingAction === 'addConfig') {
-            endLoading();
-          }
           break;
         case 'configDetail':
           renderParams(msg.params);
