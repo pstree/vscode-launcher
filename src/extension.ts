@@ -4,6 +4,13 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { l10n } from './l10n';
 import { LaunchConfigEditor } from './launchConfigEditor';
+import {
+  parseSsListenOutput,
+  parseLsofListenOutput,
+  parseNetTcpConnectionCsv,
+  filterExcluded,
+  extractDebugPortsFromCommandLine,
+} from './portParsers';
 
 // ---------------------------------------------------------------------------
 // 类型与模型
@@ -60,6 +67,7 @@ interface SessionEntry {
   pollAttempts?: number; // 主动轮询尝试次数（用于退避与上限）
   pollExcluded?: Set<number>; // 需从监听端口中排除的端口集合
   jdwpChecked?: boolean; // 是否已尝试从进程命令行提取 JDWP 端口
+  emptyPidStreak?: number; // 连续拿不到 PID 的轮数（用于空轮询短路）
 }
 
 // ---------------------------------------------------------------------------
@@ -174,18 +182,6 @@ function extractAppPort(text: string, patterns: RegExp[]): number | undefined {
   return undefined;
 }
 
-/** 从进程命令行解析 JDWP 调试端口 (address=XXXX) */
-function extractJdwpPortFromCommandLine(commandLine: string): number | undefined {
-  const m = /address=(?:[^\s:]+:)?(\d+)/i.exec(commandLine);
-  if (m && m[1]) {
-    const p = parseInt(m[1], 10);
-    if (!isNaN(p) && p > 0 && p < 65536) {
-      return p;
-    }
-  }
-  return undefined;
-}
-
 /** 挑选最佳应用端口（优先 < 32768 的标准端口，排除动态高位调试端口） */
 function selectBestAppPort(ports: number[]): number | undefined {
   if (ports.length === 0) {
@@ -205,7 +201,56 @@ function selectBestAppPort(ports: number[]): number | undefined {
   return sorted[0];
 }
 
-/** 查询指定 PIDs 在操作系统层面监听的 TCP 端口，返回 pid → ports 的映射 */
+/** 批量提取这些 PID 命令行中的调试 / JMX 端口。
+ *  非 Windows：一次 ps 覆盖全部 PID；Windows：保持逐个 PowerShell 查询。 */
+async function collectDebugPortsFromPids(pids: number[]): Promise<number[]> {
+  const ports: number[] = [];
+  if (pids.length === 0) {
+    return ports;
+  }
+  const cmdLines: string[] = [];
+
+  if (process.platform === 'win32') {
+    for (const pid of pids) {
+      try {
+        const { stdout } = await promisify(exec)(
+          `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId = ${pid}\\").CommandLine"`
+        );
+        if (stdout) {
+          cmdLines.push(String(stdout));
+        }
+      } catch {}
+    }
+  } else {
+    try {
+      // 一次 ps 覆盖全部 PID；个别 PID 已退出会让 ps 非零退出，
+      // 用 2>/dev/null || true 保住 stdout 中已存在的部分。
+      const { stdout } = await promisify(exec)(
+        `ps -o pid=,command= -p ${pids.join(',')} 2>/dev/null || true`
+      );
+      for (const line of String(stdout).split(/[\r\n]+/)) {
+        // 列序 pid=,command= → 「pid 空格 命令行」
+        const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+        if (m && m[2]) {
+          cmdLines.push(m[2]);
+        }
+      }
+    } catch {}
+  }
+
+  for (const cmdLine of cmdLines) {
+    for (const p of extractDebugPortsFromCommandLine(cmdLine)) {
+      if (!ports.includes(p)) {
+        ports.push(p);
+      }
+    }
+  }
+  return ports;
+}
+
+/** 查询指定 PIDs 在操作系统层面监听的 TCP 端口，返回 pid → ports 的映射。
+ *  非 Windows：一次全量监听表 + 内存按 PID 过滤（避免逐 PID 串行 fork）；
+ *  Windows：单条 PowerShell 按 OwningProcess 过滤（原本即单次调用，保持不动）。 */
 async function getListeningPortsForPids(
   pids: number[],
   excluded: Set<number>
@@ -215,16 +260,8 @@ async function getListeningPortsForPids(
   if (uniquePids.length === 0) {
     return result;
   }
-  const add = (pid: number, port: number) => {
-    if (isNaN(port) || port <= 0 || excluded.has(port)) {
-      return;
-    }
-    const list = result.get(pid) ?? [];
-    if (!list.includes(port)) {
-      list.push(port);
-      result.set(pid, list);
-    }
-  };
+  const target = new Set(uniquePids);
+
   if (process.platform === 'win32') {
     // 合并所有 PID 为一条 PowerShell 命令查询，避免逐 PID fork powershell 进程，
     // 同时保留 OwningProcess 以便正确归属端口。
@@ -232,69 +269,38 @@ async function getListeningPortsForPids(
     const netCmd = `powershell -NoProfile -Command "Get-NetTCPConnection -OwningProcess @(${pidList}) -State Listen -ErrorAction SilentlyContinue | Select-Object OwningProcess, LocalPort | ConvertTo-Csv -NoTypeInformation"`;
     try {
       const { stdout } = await promisify(exec)(netCmd);
-      // CSV 首行为表头
-      stdout
-        .split(/[\r\n]+/)
-        .slice(1)
-        .forEach((line) => {
-          const cols = line.split(',');
-          if (cols.length >= 2) {
-            const pid = parseInt(cols[0].replace(/"/g, ''), 10);
-            const port = parseInt(cols[1].replace(/"/g, ''), 10);
-            if (!isNaN(pid) && pid > 0) {
-              add(pid, port);
-            }
-          }
-        });
-    } catch {}
-  } else {
-    for (const pid of uniquePids) {
-      try {
-        const cmd = `lsof -a -p ${pid} -i -a -sTCP:LISTEN -P -n 2>/dev/null`;
-        const { stdout } = await promisify(exec)(cmd);
-        const matches = stdout.matchAll(/:(\d+)\s+\(LISTEN\)/g);
-        for (const m of matches) {
-          add(pid, parseInt(m[1], 10));
-        }
-      } catch {}
-    }
-    if (result.size === 0 && process.platform === 'linux') {
-      // 兜底：lsof 缺失或解析失败时，用 ss -tlnp 获取监听端口。
-      // 由于此前逐 PID lsof 已失败，此处在未知进程归属的情况下，
-      // 直接收集所有监听端口并尝试关联到当前 session 的 PID。
-      try {
-        const { stdout } = await promisify(exec)(`ss -tlnp 2>/dev/null`);
-        const lines = stdout.split(/[\r\n]+/);
-        for (const line of lines) {
-          // ss 进程信息格式多样（如 pid=123、pid=123,、user=...,pid=123,fd=...），
-          // 用正则提取行内所有 pid=，而非依赖固定逗号分隔。
-          const pidMatches = Array.from(line.matchAll(/pid=(\d+)/g));
-          if (pidMatches.length === 0) {
-            continue;
-          }
-          // 解析监听端口：ss -tln 列序为 Recv-Q Send-Q Local Foreign State Process，
-          // Local Address:Port 形态多样（127.0.0.1:8080 / 0.0.0.0:8080 / *:8080 / [::]:8080），
-          // 用「]或数字或*」后跟「:端口」来匹配本地端口；Peer 列常为 *:* 或 0.0.0.0:*，
-          // 不会因数字端口而干扰。
-          const portMatch = /(?:\]|[0-9]|\*):(\d{1,5})\b/.exec(line);
-          if (!portMatch || !portMatch[1]) {
-            continue;
-          }
-          const localPort = parseInt(portMatch[1], 10);
-          if (isNaN(localPort) || localPort <= 0 || localPort >= 65536) {
-            continue;
-          }
-          for (const pm of pidMatches) {
-            const pid = parseInt(pm[1], 10);
-            if (!isNaN(pid) && pid > 0) {
-              add(pid, localPort);
-            }
-          }
-        }
-      } catch {}
+      return filterExcluded(parseNetTcpConnectionCsv(String(stdout), target), excluded);
+    } catch {
+      return result;
     }
   }
-  return result;
+
+  // 外部命令统一在此降级：缺失 / 超时 / 非零退出都只返回空结果，不让异常冒泡
+  const opts = { maxBuffer: 4 * 1024 * 1024, timeout: 5000 };
+  const run = async (cmd: string): Promise<string> => {
+    try {
+      return String((await promisify(exec)(cmd, opts)).stdout);
+    } catch {
+      return '';
+    }
+  };
+
+  let map: Map<number, number[]>;
+  if (process.platform === 'darwin') {
+    // macOS 无 ss，用系统自带 lsof 取全量监听表（全表扫描偶发很慢，由 timeout 兜住）
+    map = parseLsofListenOutput(await run(`lsof -nP -iTCP -sTCP:LISTEN`), target);
+  } else {
+    // Linux：ss 比 lsof 快，且一次调用即覆盖全部 PID
+    const ssOut = await run(`ss -tlnp`);
+    map = parseSsListenOutput(ssOut, target);
+    // 仅当 ss 输出里完全没有进程信息（命令缺失 / 不支持进程列 / 权限不足）时，
+    // 才整个调用级回退 lsof。若已有 pid= 只是未命中本批 PID，说明应用尚未开始监听，
+    // 此时回退也查不到，反而让启动窗口内每轮多 fork 一次。
+    if (!ssOut.includes('pid=')) {
+      map = parseLsofListenOutput(await run(`lsof -nP -iTCP -sTCP:LISTEN`), target);
+    }
+  }
+  return filterExcluded(map, excluded);
 }
 
 /** 收集指定 session/配置名关联的进程 PID（marker 进程 + 集成终端进程子树） */
@@ -377,6 +383,7 @@ async function collectPidsForSession(
 let treeProvider: MultiLaunchProvider | undefined; // 由 activate 赋值
 const pollPool = new Set<SessionEntry>(); // 待轮询的 session 集合
 const POLL_MAX_ATTEMPTS = 30; // 单 session 最大探测次数（对应最长 ~90s）
+const EMPTY_PID_MAX_STREAK = 5; // 连续空 PID 次数上限（约 10s 宽限期）
 let pollTimer: NodeJS.Timeout | undefined;
 let pollRunning = false; // 防止并发重入
 
@@ -431,28 +438,29 @@ async function runPolling(): Promise<void> {
 
     for (const { entry, pids } of pidsByName) {
       entry.pollAttempts = (entry.pollAttempts ?? 0) + 1;
+
+      // 终端已存在（命令已下达）却连续多轮拿不到任何 PID → 判定进程未起来或已退出，
+      // 停止空轮询。编译期间终端尚未创建，不计入，故不误伤大项目的长编译。
+      if (pids.length === 0) {
+        if (entry.terminal) {
+          entry.emptyPidStreak = (entry.emptyPidStreak ?? 0) + 1;
+          if (entry.emptyPidStreak >= EMPTY_PID_MAX_STREAK) {
+            unregisterPolling(entry);
+            continue;
+          }
+        }
+      } else {
+        entry.emptyPidStreak = 0;
+      }
+
       const excluded = entry.pollExcluded ?? new Set<number>();
-      // 首次轮询时，从各 PID 的命令行提取 JDWP 调试端口并排除，
+      // 首次轮询时，从各 PID 的命令行提取 JDWP / JMX 端口并排除，
       // 避免把调试端口误判为应用端口（只做一次，降低开销）。
       if (!entry.jdwpChecked && pids.length > 0) {
         entry.jdwpChecked = true;
-        try {
-          const cmdLines = await Promise.all(
-            pids.map((pid) =>
-              promisify(exec)(
-                process.platform === 'win32'
-                  ? `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId = ${pid}\\").CommandLine"`
-                  : `ps -p ${pid} -o command=`
-              ).then((r) => r.stdout, () => '')
-            )
-          );
-          for (const cl of cmdLines) {
-            const jdwp = extractJdwpPortFromCommandLine(cl);
-            if (jdwp) {
-              excluded.add(jdwp);
-            }
-          }
-        } catch {}
+        for (const p of await collectDebugPortsFromPids(pids)) {
+          excluded.add(p);
+        }
       }
       // 汇总「属于本 session 各 PID」且未被排除的监听端口
       const ports: number[] = [];
@@ -752,6 +760,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
       entry.pollExcluded = excluded;
       entry.pollAttempts = 0;
+      entry.emptyPidStreak = 0;
       registerPolling(entry);
 
       provider.refresh();
