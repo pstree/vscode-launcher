@@ -61,7 +61,8 @@ Built-in port parsing rules (matched in order, first hit wins):
 - `Started ... on port(s) <port>`
 - `Listening on ... <port>` / `Server started on ... <port>` / `App running on ... <port>`
 - `Local: http://...:<port>` / `Network: http://...:<port>`
-- Generic fallback: `started on port ... <port>` / `port: <port>` / `port=<port>`
+- Generic: `started on port ... <port>`
+- **Weak fallback**: bare mentions of a port (`port: <port>` / `port=<port>`). These can false-positive on dependency ports (Redis/MySQL) or debug ports, so a weak hit is only used for display and OS polling keeps running to confirm or override it.
 
 ## Port Allocation Rules (Java)
 
@@ -79,7 +80,7 @@ When a Java configuration launches in the integrated terminal, the Debug Adapter
 2. Queries the OS for TCP **LISTEN** sockets owned by those PIDs (`Get-NetTCPConnection` on Windows; `lsof`/`ss` on macOS/Linux).
 3. Excludes known debug/JMX ports and any JDWP port found in the process command line, then picks the best candidate (preferring standard ports `< 32768`).
 
-If a port is detected in the logs via the DAP tracker, that takes precedence and OS polling stops.
+A **strong** DAP hit takes precedence and stops OS polling; a weak hit is display-only, and OS polling continues to confirm or override it.
 
 ## Scope & Requirements
 

@@ -61,7 +61,8 @@ npx @vscode/vsce package --allow-missing-repository
 - `Started ... on port(s) <port>`
 - `Listening on ... <port>` / `Server started on ... <port>` / `App running on ... <port>`
 - `Local: http://...:<port>` / `Network: http://...:<port>`
-- 通用兜底：`started on port ... <port>` / `port: <port>` / `port=<port>`
+- 通用：`started on port ... <port>`
+- **弱规则（兜底）**：`port: <port>` / `port=<port>` 等"日志里提到端口号"的情况。它可能误命中依赖端口（Redis/MySQL）或调试端口，因此命中后只用于显示，仍会继续用 OS 监听表确认或覆盖。
 
 ## 端口分配规则（Java）
 
@@ -79,7 +80,7 @@ npx @vscode/vsce package --allow-missing-repository
 2. 查询操作系统层面这些 PID 拥有的 TCP **LISTEN** 套接字（Windows 用 `Get-NetTCPConnection`，macOS/Linux 用 `lsof` / `ss`）。
 3. 排除已知的调试/JMX 端口以及从进程命令行中提取的 JDWP 端口，再挑选最佳候选端口（优先 `< 32768` 的标准端口）。
 
-若通过 DAP tracker 从日志中解析到端口，则优先采用并停止 OS 轮询。
+若通过 DAP tracker 以**强规则**从日志中解析到端口，则优先采用并停止 OS 轮询；弱规则命中只用于显示，仍由 OS 轮询确认或覆盖。
 
 ## 适用范围
 

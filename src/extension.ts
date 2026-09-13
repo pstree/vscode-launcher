@@ -130,7 +130,11 @@ interface SessionEntry {
   jmx?: number;
   rmi?: number;
   appPort?: number;
+  /** 当前 appPort 的来源，决定后续能否被别的来源覆盖 */
+  portSource?: PortSource;
   portVerified?: boolean; // 端口已权威确认标志
+  /** 上一轮 OS 轮询看到的端口，用于「连续两轮一致」确认 */
+  lastOsPort?: number;
   outputBuffer?: string;
   terminal?: vscode.Terminal;
   pollAttempts?: number; // 主动轮询尝试次数（用于退避与上限）
@@ -210,7 +214,16 @@ function mergeVmArgs(original: string | string[] | undefined, jmxArgs: string): 
 // 程序端口解析（监听 session 输出）
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PORT_PATTERNS: RegExp[] = [
+/** DAP output 累积上限（字符），仅用于保留最近一段日志 */
+const OUTPUT_BUFFER_LIMIT = 20000;
+/** 增量扫描时回看上一轮的尾巴长度，兜住被 DAP 分片截断的端口号 */
+const SCAN_OVERLAP = 200;
+
+/**
+ * 强规则：这些是框架启动横幅的固定措辞，几乎不可能指向别的端口，
+ * 命中即可视为权威确认。
+ */
+const STRONG_PORT_PATTERNS: RegExp[] = [
   /Tomcat started on port(?:\(s\))?:?\s*(\d+)/i,
   /Tomcat initialized with port(?:\(s\))?:?\s*(\d+)/i,
   /(?:Netty|Undertow|Jetty|WebServer|Web server)\s+started on port(?:\(s\))?:?\s*(\d+)/i,
@@ -220,10 +233,23 @@ const DEFAULT_PORT_PATTERNS: RegExp[] = [
   /(?:Listening on|Server started on|App running on)\s+(?:http:\/\/[^\s:]+:)?(\d+)/i,
   /(?:Local|Network):\s+http:\/\/[^\s:]+:(\d+)/i,
   /\bstarted on port(?:\(s\))?:?\s*(\d+)/i,
+];
+
+/**
+ * 弱规则（兜底）：只要日志里「提到」一个端口号就算。
+ * 日志中出现依赖端口（Redis / MySQL）、重试端口、调试端口的概率不低，
+ * 因此命中后只用于展示、不置 portVerified，仍让 OS 监听表轮询来确认或覆盖。
+ */
+const WEAK_PORT_PATTERNS: RegExp[] = [
   /\bport(?:\(s\))?\s*[:=]?\s*(\d{2,5})\b/i,
 ];
 
-function getPortPatterns(): RegExp[] {
+interface PortPatterns {
+  strong: RegExp[];
+  weak: RegExp[];
+}
+
+function getPortPatterns(): PortPatterns {
   const cfg = vscode.workspace.getConfiguration('multiLauncher');
   const extra = cfg.get<string[]>('portPatterns', []);
   const parsed = extra
@@ -235,7 +261,8 @@ function getPortPatterns(): RegExp[] {
       }
     })
     .filter((r): r is RegExp => r !== null);
-  return [...DEFAULT_PORT_PATTERNS, ...parsed];
+  // 用户自定义的规则按「强规则」对待：用户清楚自己的日志长什么样
+  return { strong: [...STRONG_PORT_PATTERNS, ...parsed], weak: WEAK_PORT_PATTERNS };
 }
 
 /** 统一的只读外部命令执行：缺失 / 超时 / 非零退出一律返回空串，不让异常冒泡 */
@@ -255,7 +282,7 @@ function parsePidList(stdout: string): number[] {
     .filter((n) => !isNaN(n) && n > 0);
 }
 
-function extractAppPort(text: string, patterns: RegExp[]): number | undefined {
+function firstPortIn(text: string, patterns: RegExp[]): number | undefined {
   for (const re of patterns) {
     const m = re.exec(text);
     if (m && m[1]) {
@@ -266,6 +293,26 @@ function extractAppPort(text: string, patterns: RegExp[]): number | undefined {
     }
   }
   return undefined;
+}
+
+/** 端口来源：可信度 weak < os < strong */
+type PortSource = 'weak' | 'os' | 'strong';
+
+const PORT_SOURCE_RANK: Record<PortSource, number> = { weak: 0, os: 1, strong: 2 };
+
+interface PortHit {
+  port: number;
+  source: PortSource;
+}
+
+/** 先试强规则，再退到弱规则 */
+function extractPortHit(text: string, patterns: PortPatterns): PortHit | undefined {
+  const strong = firstPortIn(text, patterns.strong);
+  if (strong !== undefined) {
+    return { port: strong, source: 'strong' };
+  }
+  const weak = firstPortIn(text, patterns.weak);
+  return weak === undefined ? undefined : { port: weak, source: 'weak' };
 }
 
 /** 挑选最佳应用端口（优先 < 32768 的标准端口，排除动态高位调试端口） */
@@ -426,7 +473,9 @@ async function collectPidsForSession(key: string, terminal?: vscode.Terminal): P
 // ---------------------------------------------------------------------------
 let treeProvider: MultiLaunchProvider | undefined; // 由 activate 赋值
 const pollPool = new Set<SessionEntry>(); // 待轮询的 session 集合
-const POLL_MAX_ATTEMPTS = 30; // 单 session 最大探测次数（对应最长 ~90s）
+// 单 session 最大探测次数。配合 pollIntervalFor 的退避（2s→4s→…→22s），
+// 30 次对应最长约 9 分钟：大项目冷启动慢时有足够余量，且一旦权威确认就提前退出。
+const POLL_MAX_ATTEMPTS = 30;
 const EMPTY_PID_MAX_STREAK = 5; // 连续空 PID 次数上限（约 10s 宽限期）
 let pollTimer: NodeJS.Timeout | undefined;
 let pollRunning = false; // 防止并发重入
@@ -453,6 +502,33 @@ function unregisterPolling(entry: SessionEntry): void {
 function pollIntervalFor(entry: SessionEntry): number {
   const attempts = entry.pollAttempts ?? 0;
   return 2000 + Math.min(attempts, 10) * 2000;
+}
+
+/**
+ * 写入应用端口。规则：
+ * - 已权威确认（portVerified）后不再改写，避免端口来回抖动；
+ * - 低可信度来源不得覆盖高可信度来源（weak < os < strong）；
+ * - strong / os 视为权威确认，写入后立即移出轮询池，避免长期反复查询与刷新；
+ * - os 额外要求「连续两轮观察到同一端口」（verify=true）才确认，
+ *   以免把启动瞬间的临时端口当成业务端口。
+ * 返回是否需要刷新树视图。
+ */
+function applyPort(entry: SessionEntry, port: number, source: PortSource, verify: boolean): boolean {
+  if (entry.portVerified) {
+    return false;
+  }
+  const current = entry.portSource;
+  if (current && PORT_SOURCE_RANK[current] > PORT_SOURCE_RANK[source]) {
+    return false;
+  }
+  const changed = entry.appPort !== port || current !== source;
+  entry.appPort = port;
+  entry.portSource = source;
+  if (verify) {
+    entry.portVerified = true;
+    unregisterPolling(entry);
+  }
+  return changed;
 }
 
 /** 批量轮询：并发收集所有待探测 PID，一次性批量查询端口 */
@@ -516,12 +592,17 @@ async function runPolling(): Promise<void> {
         }
       }
       const bestPort = selectBestAppPort(ports);
-      if (bestPort !== undefined && !entry.portVerified) {
-        entry.appPort = bestPort;
-        treeProvider?.refresh();
+      if (bestPort !== undefined) {
+        // OS 监听表本身是权威的，但启动瞬间可能先绑上临时端口，
+        // 故要求连续两轮看到同一端口才确认为业务端口。
+        const confirmed = entry.lastOsPort === bestPort;
+        entry.lastOsPort = bestPort;
+        if (applyPort(entry, bestPort, 'os', confirmed)) {
+          treeProvider?.refresh();
+        }
       }
-      // 达到上限或已权威确认 → 移出轮询池
-      if (entry.portVerified || (entry.pollAttempts ?? 0) >= POLL_MAX_ATTEMPTS) {
+      // 达到次数上限 → 移出轮询池（权威确认的情况 applyPort 已移出）
+      if (!entry.portVerified && (entry.pollAttempts ?? 0) >= POLL_MAX_ATTEMPTS) {
         unregisterPolling(entry);
       }
     }
@@ -864,25 +945,24 @@ export function activate(context: vscode.ExtensionContext) {
         }
         return {
           onDidSendMessage(message: any) {
-            if (message && message.type === 'event' && message.event === 'output' && message.body) {
-              const text: string = message.body.output ?? '';
-              if (!text) {
-                return;
-              }
-              const entry = findEntryBySessionId(sessionMap, session.id);
-              if (entry && !entry.portVerified) {
-                entry.outputBuffer = (entry.outputBuffer ?? '') + text;
-                if (entry.outputBuffer.length > 20000) {
-                  entry.outputBuffer = entry.outputBuffer.slice(-20000);
-                }
-                const port = extractAppPort(entry.outputBuffer, patterns);
-                if (port !== undefined) {
-                  entry.appPort = port;
-                  entry.portVerified = true;
-                  unregisterPolling(entry);
-                  provider.refresh();
-                }
-              }
+            if (!(message && message.type === 'event' && message.event === 'output' && message.body)) {
+              return;
+            }
+            const text: string = message.body.output ?? '';
+            if (!text) {
+              return;
+            }
+            const entry = findEntryBySessionId(sessionMap, session.id);
+            if (!entry || entry.portVerified) {
+              return;
+            }
+            const prev = entry.outputBuffer ?? '';
+            entry.outputBuffer = (prev + text).slice(-OUTPUT_BUFFER_LIMIT);
+            // 只扫「上轮尾巴 + 新文本」：避免每个 output 事件都对整段缓冲区做全量正则重扫；
+            // 保留 SCAN_OVERLAP 是为了兜住被 DAP 分片截断的端口号。
+            const hit = extractPortHit(prev.slice(-SCAN_OVERLAP) + text, patterns);
+            if (hit && applyPort(entry, hit.port, hit.source, hit.source === 'strong')) {
+              provider.refresh();
             }
           },
         };
