@@ -78,9 +78,15 @@ npx @vscode/vsce package --allow-missing-repository
 
 1. 通过唯一标记（`-DmultiLauncher.id=...`）识别启动进程及其子进程。
 2. 查询操作系统层面这些 PID 拥有的 TCP **LISTEN** 套接字（Windows 用 `Get-NetTCPConnection`，macOS/Linux 用 `lsof` / `ss`）。
-3. 排除已知的调试/JMX 端口以及从进程命令行中提取的 JDWP 端口，再挑选最佳候选端口（优先 `< 32768` 的标准端口）。
+3. 排除以下端口后再挑选最佳候选（优先 `< 32768` 的常规业务端口）：
+   - **JMX 分配区间整段 `61000–64999`**——JMX/RMI 除注入的 jmx、rmi 两个端口外，还可能在同一区间内额外监听随机端口（RMI DGC / 临时 export），只排除那两个不够；
+   - 本 session 注入的 jmx / rmi 端口；
+   - 从进程命令行提取到的 JDWP / JMX 端口（`address=...`、`jmxremote(.rmi).port=`）；
+   - 配置里声明的 `port` / `debugPort` / `jdwpPort`。
 
 若通过 DAP tracker 以**强规则**从日志中解析到端口，则优先采用并停止 OS 轮询；弱规则命中只用于显示，仍由 OS 轮询确认或覆盖。
+
+高位端口（`>= 32768`）只用于显示、不会被"锁定"：RMI 在未显式指定端口时会从系统的临时端口带随机取端口（Linux 从 32768 起，Windows / macOS 从 49152 起），这类端口不能作为业务端口采信。同理，已确认的端口在应用随后打印出启动横幅（强规则）时仍会被纠正。
 
 ## 适用范围
 

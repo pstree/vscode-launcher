@@ -78,9 +78,15 @@ When a Java configuration launches in the integrated terminal, the Debug Adapter
 
 1. Detects the launched process and its child processes via a unique marker (`-DmultiLauncher.id=...`).
 2. Queries the OS for TCP **LISTEN** sockets owned by those PIDs (`Get-NetTCPConnection` on Windows; `lsof`/`ss` on macOS/Linux).
-3. Excludes known debug/JMX ports and any JDWP port found in the process command line, then picks the best candidate (preferring standard ports `< 32768`).
+3. Excludes these before picking the best candidate (preferring standard ports `< 32768`):
+   - **the whole JMX allocation band `61000–64999`** — besides the injected jmx/rmi ports, JMX/RMI may additionally listen on random ports within that band (RMI DGC / transient exports), so excluding just those two is not enough;
+   - the injected jmx/rmi ports for this session;
+   - any JDWP/JMX port found in the process command line (`address=...`, `jmxremote(.rmi).port=`);
+   - the `port` / `debugPort` / `jdwpPort` declared in the configuration.
 
 A **strong** DAP hit takes precedence and stops OS polling; a weak hit is display-only, and OS polling continues to confirm or override it.
+
+High ports (`>= 32768`) are shown but never "locked in": when RMI is not given an explicit port it picks a random one from the OS ephemeral range (32768+ on Linux, 49152+ on Windows/macOS), so such a port must not be trusted as the application port. Likewise, an already-confirmed port is still corrected when the application later prints its startup banner (a strong hit).
 
 ## Scope & Requirements
 

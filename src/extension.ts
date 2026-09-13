@@ -144,6 +144,26 @@ interface SessionEntry {
 }
 
 // ---------------------------------------------------------------------------
+// 端口常量
+// ---------------------------------------------------------------------------
+
+/** 本插件为 JMX / RMI 分配端口的区间起点 */
+const JMX_PORT_BASE = 61000;
+/** 分配区间长度；实际可用区间为 [JMX_PORT_BASE, JMX_PORT_MAX] */
+const JMX_PORT_RANGE = 4000;
+const JMX_PORT_MAX = JMX_PORT_BASE + JMX_PORT_RANGE - 1;
+
+/**
+ * 动态 / 临时端口下界。各系统 ephemeral range 的起点：
+ * Linux 默认 32768，Windows / macOS 为 49152，取其中最小者，
+ * 作为「低于它才算常规业务端口」的判据。
+ *
+ * RMI 在没有显式指定端口时会从这一带随机取端口（DGC / 临时 export），
+ * 因此高位端口只能用于展示，不足以被确认为业务端口。
+ */
+const EPHEMERAL_PORT_MIN = 32768;
+
+// ---------------------------------------------------------------------------
 // 端口分配（Java 专用）
 // ---------------------------------------------------------------------------
 
@@ -168,10 +188,10 @@ function isPortTaken(port: number): Promise<boolean> {
   });
 }
 
-/** 分配 JMX 端口对：base∈[61000,64999]，jmx=base / rmi=base+1；
+/** 分配 JMX 端口对：base∈[JMX_PORT_BASE, JMX_PORT_MAX-1]，jmx=base / rmi=base+1；
  *  本批次冲突或被占用则 base+=2 重试。同名单配置端口稳定。 */
 async function allocPorts(name: string, used: Set<number>): Promise<{ jmx: number; rmi: number }> {
-  let base = 61000 + (hash(name) % 4000);
+  let base = JMX_PORT_BASE + (hash(name) % JMX_PORT_RANGE);
   while (
     used.has(base) ||
     used.has(base + 1) ||
@@ -179,8 +199,8 @@ async function allocPorts(name: string, used: Set<number>): Promise<{ jmx: numbe
     (await isPortTaken(base + 1))
   ) {
     base += 2;
-    if (base > 64999) {
-      base = 61000; // 极端情况回卷（理论不会到这）
+    if (base > JMX_PORT_MAX - 1) {
+      base = JMX_PORT_BASE; // 回卷；减 1 是为了保证 base+1 也落在区间内
     }
   }
   used.add(base);
@@ -315,7 +335,7 @@ function extractPortHit(text: string, patterns: PortPatterns): PortHit | undefin
   return weak === undefined ? undefined : { port: weak, source: 'weak' };
 }
 
-/** 挑选最佳应用端口（优先 < 32768 的标准端口，排除动态高位调试端口） */
+/** 挑选最佳应用端口（优先常规业务端口，排除动态高位端口） */
 function selectBestAppPort(ports: number[]): number | undefined {
   if (ports.length === 0) {
     return undefined;
@@ -324,8 +344,8 @@ function selectBestAppPort(ports: number[]): number | undefined {
     return ports[0];
   }
   const sorted = [...ports].sort((a, b) => {
-    const aEph = a >= 32768;
-    const bEph = b >= 32768;
+    const aEph = a >= EPHEMERAL_PORT_MIN;
+    const bEph = b >= EPHEMERAL_PORT_MIN;
     if (aEph !== bEph) {
       return aEph ? 1 : -1;
     }
@@ -506,19 +526,22 @@ function pollIntervalFor(entry: SessionEntry): number {
 
 /**
  * 写入应用端口。规则：
- * - 已权威确认（portVerified）后不再改写，避免端口来回抖动；
  * - 低可信度来源不得覆盖高可信度来源（weak < os < strong）；
- * - strong / os 视为权威确认，写入后立即移出轮询池，避免长期反复查询与刷新；
- * - os 额外要求「连续两轮观察到同一端口」（verify=true）才确认，
- *   以免把启动瞬间的临时端口当成业务端口。
+ * - **已权威确认后，只允许更高可信度的来源改写**：JMX 一启动就会监听，OS 通道
+ *   常常先看到 RMI / DGC 的随机端口并「确认」，若此时把应用自己的启动横幅
+ *   （strong）挡掉，端口就会一直显示错的那个；
+ * - strong / os 可视为权威确认，确认后立即移出轮询池，避免长期反复查询与刷新；
+ * - os 的确认条件由调用方控制（见 runPolling）。
  * 返回是否需要刷新树视图。
  */
 function applyPort(entry: SessionEntry, port: number, source: PortSource, verify: boolean): boolean {
-  if (entry.portVerified) {
+  const current = entry.portSource;
+  const currentRank = current === undefined ? -1 : PORT_SOURCE_RANK[current];
+  const nextRank = PORT_SOURCE_RANK[source];
+  if (currentRank > nextRank) {
     return false;
   }
-  const current = entry.portSource;
-  if (current && PORT_SOURCE_RANK[current] > PORT_SOURCE_RANK[source]) {
+  if (entry.portVerified && currentRank >= nextRank) {
     return false;
   }
   const changed = entry.appPort !== port || current !== source;
@@ -593,11 +616,15 @@ async function runPolling(): Promise<void> {
       }
       const bestPort = selectBestAppPort(ports);
       if (bestPort !== undefined) {
-        // OS 监听表本身是权威的，但启动瞬间可能先绑上临时端口，
-        // 故要求连续两轮看到同一端口才确认为业务端口。
+        // OS 监听表看到的是「该进程当前所有监听端口」，其中可能包含 JMX / RMI
+        // 额外开的随机高位端口，因此：
+        //   - 必须连续两轮看到同一端口；
+        //   - 且该端口必须低于临时端口下界（常规业务端口），才允许确认为权威。
+        // 高位端口只用于展示，不锁定，后续应用自己的启动横幅仍可纠正它。
         const confirmed = entry.lastOsPort === bestPort;
         entry.lastOsPort = bestPort;
-        if (applyPort(entry, bestPort, 'os', confirmed)) {
+        const canVerify = confirmed && bestPort < EPHEMERAL_PORT_MIN;
+        if (applyPort(entry, bestPort, 'os', canVerify)) {
           treeProvider?.refresh();
         }
       }
@@ -862,12 +889,12 @@ export function activate(context: vscode.ExtensionContext) {
 
       // 登记到共享轮询器：在操作系统层面批量探测各 session 的 TCP 监听端口
       // （解决 console: integratedTerminal 时 DAP 收不到日志、端口解析不到的问题）
+      //
+      // JMX / RMI 除 jmx、rmi 两个显式端口外，还可能在同一区间内额外监听随机端口
+      // （RMI DGC / 临时 export），只排除 base 与 base+1 不够，故整段区间一并排除。
       const excluded = new Set<number>();
-      if (entry.jmx) {
-        excluded.add(entry.jmx);
-      }
-      if (entry.rmi) {
-        excluded.add(entry.rmi);
+      for (let p = JMX_PORT_BASE; p <= JMX_PORT_MAX; p++) {
+        excluded.add(p);
       }
       const configObj = session.configuration as any;
       if (typeof configObj.port === 'number') {
