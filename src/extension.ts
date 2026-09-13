@@ -24,6 +24,71 @@ interface LaunchConfig {
   raw: vscode.DebugConfiguration;
 }
 
+// ---------------------------------------------------------------------------
+// 配置唯一键
+// 多 folder 工作区里不同 folder 可以有同名配置，仅用 name 作键会互相串扰
+// （运行态显示、停止、进程标记都会误伤），故统一使用 folder + name 复合键。
+// ---------------------------------------------------------------------------
+
+function configKey(folder: vscode.WorkspaceFolder | undefined, name: string): string {
+  return `${folder?.uri.toString() ?? ''}\u0000${name}`;
+}
+
+function keyOfConfig(cfg: LaunchConfig): string {
+  return configKey(cfg.folder, cfg.name);
+}
+
+/** 取 session 对应的配置键：优先用启动时写入的私有字段，兜底按 folder + name 重算 */
+function keyOfSession(session: vscode.DebugSession): string {
+  const stamped = (session.configuration as any)?.[KEY_FIELD];
+  if (typeof stamped === 'string' && stamped.length > 0) {
+    return stamped;
+  }
+  return configKey(session.workspaceFolder, session.configuration.name as string);
+}
+
+/** 在映射表中按 session id 反查记录 */
+function findEntryBySessionId(
+  sessionMap: Map<string, SessionEntry[]>,
+  sessionId: string
+): SessionEntry | undefined {
+  for (const list of sessionMap.values()) {
+    const found = list.find((e) => e.session.id === sessionId);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+/** 运行中项要展示的应用端口：取该配置下第一个已解析出的端口 */
+function firstAppPort(entries: SessionEntry[]): number | undefined {
+  return entries.map((e) => e.appPort).find((p): p is number => typeof p === 'number');
+}
+
+/**
+ * 扁平化 view/title 命令收到的参数并取出 LaunchItem。
+ * VS Code 传参签名可能是 (items[]) / (item, items[]) / ()，故统一兜底并去重。
+ */
+function flattenLaunchItems(args: unknown[]): LaunchItem[] {
+  const items: LaunchItem[] = [];
+  const seen = new Set<string>();
+  const push = (item: unknown): void => {
+    if (item instanceof LaunchItem && !seen.has(item.key)) {
+      seen.add(item.key);
+      items.push(item);
+    }
+  };
+  for (const arg of args) {
+    if (Array.isArray(arg)) {
+      arg.forEach(push);
+    } else {
+      push(arg);
+    }
+  }
+  return items;
+}
+
 /** 分组节点（运行中 / 未运行） */
 class GroupItem extends vscode.TreeItem {
   constructor(public readonly kind: 'running' | 'idle', public readonly count: number) {
@@ -38,6 +103,8 @@ class GroupItem extends vscode.TreeItem {
 class LaunchItem extends vscode.TreeItem {
   constructor(
     public readonly cfg: LaunchConfig,
+    /** 全局唯一标识：folder + name，跨 folder 同名配置互不串扰 */
+    public readonly key: string,
     public readonly running: boolean,
     public readonly checked: boolean,
     public readonly appPort?: number
@@ -58,6 +125,8 @@ class LaunchItem extends vscode.TreeItem {
 /** 本插件启动的 session 记录 */
 interface SessionEntry {
   session: vscode.DebugSession;
+  /** 与 sessionMap / unchecked / marker 共用的配置唯一键 */
+  key: string;
   jmx?: number;
   rmi?: number;
   appPort?: number;
@@ -169,6 +238,23 @@ function getPortPatterns(): RegExp[] {
   return [...DEFAULT_PORT_PATTERNS, ...parsed];
 }
 
+/** 统一的只读外部命令执行：缺失 / 超时 / 非零退出一律返回空串，不让异常冒泡 */
+async function execText(cmd: string, opts?: { maxBuffer?: number; timeout?: number }): Promise<string> {
+  try {
+    return String((await promisify(exec)(cmd, opts)).stdout);
+  } catch {
+    return '';
+  }
+}
+
+/** 解析「一行一个 PID」的命令输出（pgrep / Get-CimInstance 等） */
+function parsePidList(stdout: string): number[] {
+  return stdout
+    .split(/[\r\n]+/)
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => !isNaN(n) && n > 0);
+}
+
 function extractAppPort(text: string, patterns: RegExp[]): number | undefined {
   for (const re of patterns) {
     const m = re.exec(text);
@@ -212,30 +298,24 @@ async function collectDebugPortsFromPids(pids: number[]): Promise<number[]> {
 
   if (process.platform === 'win32') {
     for (const pid of pids) {
-      try {
-        const { stdout } = await promisify(exec)(
-          `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId = ${pid}\\").CommandLine"`
-        );
-        if (stdout) {
-          cmdLines.push(String(stdout));
-        }
-      } catch {}
+      const out = await execText(
+        `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \\"ProcessId = ${pid}\\").CommandLine"`
+      );
+      if (out) {
+        cmdLines.push(out);
+      }
     }
   } else {
-    try {
-      // 一次 ps 覆盖全部 PID；个别 PID 已退出会让 ps 非零退出，
-      // 用 2>/dev/null || true 保住 stdout 中已存在的部分。
-      const { stdout } = await promisify(exec)(
-        `ps -o pid=,command= -p ${pids.join(',')} 2>/dev/null || true`
-      );
-      for (const line of String(stdout).split(/[\r\n]+/)) {
-        // 列序 pid=,command= → 「pid 空格 命令行」
-        const m = /^\s*(\d+)\s+(.*)$/.exec(line);
-        if (m && m[2]) {
-          cmdLines.push(m[2]);
-        }
+    // 一次 ps 覆盖全部 PID；个别 PID 已退出会让 ps 非零退出，
+    // 用 2>/dev/null || true 保住 stdout 中已存在的部分。
+    const out = await execText(`ps -o pid=,command= -p ${pids.join(',')} 2>/dev/null || true`);
+    for (const line of out.split(/[\r\n]+/)) {
+      // 列序 pid=,command= → 「pid 空格 命令行」
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (m && m[2]) {
+        cmdLines.push(m[2]);
       }
-    } catch {}
+    }
   }
 
   for (const cmdLine of cmdLines) {
@@ -267,108 +347,72 @@ async function getListeningPortsForPids(
     // 同时保留 OwningProcess 以便正确归属端口。
     const pidList = uniquePids.join(',');
     const netCmd = `powershell -NoProfile -Command "Get-NetTCPConnection -OwningProcess @(${pidList}) -State Listen -ErrorAction SilentlyContinue | Select-Object OwningProcess, LocalPort | ConvertTo-Csv -NoTypeInformation"`;
-    try {
-      const { stdout } = await promisify(exec)(netCmd);
-      return filterExcluded(parseNetTcpConnectionCsv(String(stdout), target), excluded);
-    } catch {
-      return result;
-    }
+    return filterExcluded(parseNetTcpConnectionCsv(await execText(netCmd), target), excluded);
   }
 
-  // 外部命令统一在此降级：缺失 / 超时 / 非零退出都只返回空结果，不让异常冒泡
+  // 外部命令统一在 execText 内降级：缺失 / 超时 / 非零退出都只返回空结果
   const opts = { maxBuffer: 4 * 1024 * 1024, timeout: 5000 };
-  const run = async (cmd: string): Promise<string> => {
-    try {
-      return String((await promisify(exec)(cmd, opts)).stdout);
-    } catch {
-      return '';
-    }
-  };
 
   let map: Map<number, number[]>;
   if (process.platform === 'darwin') {
     // macOS 无 ss，用系统自带 lsof 取全量监听表（全表扫描偶发很慢，由 timeout 兜住）
-    map = parseLsofListenOutput(await run(`lsof -nP -iTCP -sTCP:LISTEN`), target);
+    map = parseLsofListenOutput(await execText(`lsof -nP -iTCP -sTCP:LISTEN`, opts), target);
   } else {
     // Linux：ss 比 lsof 快，且一次调用即覆盖全部 PID
-    const ssOut = await run(`ss -tlnp`);
+    const ssOut = await execText(`ss -tlnp`, opts);
     map = parseSsListenOutput(ssOut, target);
     // 仅当 ss 输出里完全没有进程信息（命令缺失 / 不支持进程列 / 权限不足）时，
     // 才整个调用级回退 lsof。若已有 pid= 只是未命中本批 PID，说明应用尚未开始监听，
     // 此时回退也查不到，反而让启动窗口内每轮多 fork 一次。
     if (!ssOut.includes('pid=')) {
-      map = parseLsofListenOutput(await run(`lsof -nP -iTCP -sTCP:LISTEN`), target);
+      map = parseLsofListenOutput(await execText(`lsof -nP -iTCP -sTCP:LISTEN`, opts), target);
     }
   }
   return filterExcluded(map, excluded);
 }
 
-/** 收集指定 session/配置名关联的进程 PID（marker 进程 + 集成终端进程子树） */
-async function collectPidsForSession(
-  name: string,
-  terminal?: vscode.Terminal
-): Promise<number[]> {
+/** 查询某个进程的直接子进程 PID（Windows 走 PowerShell，其余走 pgrep -P） */
+async function childPids(parentPid: number): Promise<number[]> {
+  const cmd =
+    process.platform === 'win32'
+      ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${parentPid}' | Select-Object -ExpandProperty ProcessId"`
+      : `pgrep -P ${parentPid}`;
+  return parsePidList(await execText(cmd));
+}
+
+/** 收集指定配置关联的进程 PID（marker 进程 + 集成终端进程子树） */
+async function collectPidsForSession(key: string, terminal?: vscode.Terminal): Promise<number[]> {
   const pids: number[] = [];
-  const markerId = getMarkerId(name);
+  const markerId = getMarkerId(key);
 
   if (process.platform === 'win32') {
     const safeMarker = markerId.replace(/'/g, "''");
-    const psCmd = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'CommandLine like ''%multiLauncher.id=${safeMarker}%''' | Select-Object -ExpandProperty ProcessId"`;
-    try {
-      const { stdout } = await promisify(exec)(psCmd);
-      const found = stdout
-        .split(/[\r\n]+/)
-        .map((s) => parseInt(s.trim(), 10))
-        .filter((n) => !isNaN(n) && n > 0);
-      pids.push(...found);
-    } catch {}
+    pids.push(
+      ...parsePidList(
+        await execText(
+          `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'CommandLine like ''%multiLauncher.id=${safeMarker}%''' | Select-Object -ExpandProperty ProcessId"`
+        )
+      )
+    );
   } else {
     const safeMarker = markerId.replace(/'/g, "'\\''");
-    const cmd = `pgrep -f 'multiLauncher.id=${safeMarker}'`;
-    try {
-      const { stdout } = await promisify(exec)(cmd);
-      const found = stdout
-        .split(/[\r\n]+/)
-        .map((s) => parseInt(s.trim(), 10))
-        .filter((n) => !isNaN(n) && n > 0);
-      pids.push(...found);
-    } catch {}
+    pids.push(...parsePidList(await execText(`pgrep -f 'multiLauncher.id=${safeMarker}'`)));
   }
 
-  if (terminal) {
-    try {
-      const termPid = await terminal.processId;
-      if (termPid) {
-        pids.push(termPid);
-        if (process.platform === 'win32') {
-          const c1 = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${termPid}' | Select-Object -ExpandProperty ProcessId"`;
-          const { stdout: o1 } = await promisify(exec)(c1);
-          const c1p = o1.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
-          pids.push(...c1p);
-          for (const c of c1p) {
-            const c2 = `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${c}' | Select-Object -ExpandProperty ProcessId"`;
-            try {
-              const { stdout: o2 } = await promisify(exec)(c2);
-              const c2p = o2.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
-              pids.push(...c2p);
-            } catch {}
-          }
-        } else {
-          try {
-            const { stdout: o1 } = await promisify(exec)(`pgrep -P ${termPid}`);
-            const c1p = o1.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
-            pids.push(...c1p);
-            for (const c of c1p) {
-              try {
-                const { stdout: o2 } = await promisify(exec)(`pgrep -P ${c}`);
-                const c2p = o2.split(/[\r\n]+/).map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
-                pids.push(...c2p);
-              } catch {}
-            }
-          } catch {}
-        }
-      }
-    } catch {}
+  let termPid: number | undefined;
+  try {
+    termPid = await terminal?.processId;
+  } catch {
+    termPid = undefined; // 终端已关闭 / 拿不到 PID
+  }
+  if (termPid) {
+    pids.push(termPid);
+    // 集成终端里的真实进程是终端的（孙）子进程，向下展开两层
+    const children = await childPids(termPid);
+    pids.push(...children);
+    for (const child of children) {
+      pids.push(...(await childPids(child)));
+    }
   }
 
   return Array.from(new Set(pids.filter((p) => p && p > 0)));
@@ -425,7 +469,7 @@ async function runPolling(): Promise<void> {
     // 并发收集每个 session 的 PID（会 fork 外部进程），再统一批量查端口
     const pidsByName = await Promise.all(
       pending.map(async (e) => {
-        const pids = await collectPidsForSession(e.session.configuration.name, e.terminal);
+        const pids = await collectPidsForSession(e.key, e.terminal);
         return { entry: e, pids };
       })
     );
@@ -525,42 +569,33 @@ class MultiLaunchProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
     // 根：返回两个分组
     if (!element) {
-      const all = readAllConfigs();
-      const runningItems: LaunchItem[] = [];
-      const idleItems: LaunchItem[] = [];
-      for (const cfg of all) {
-        const entries = this.sessionMap.get(cfg.name) ?? [];
-        const running = entries.length > 0;
-        const appPort = entries
-          .map((e) => e.appPort)
-          .find((p): p is number => typeof p === 'number');
-        // 默认全选：仅当配置名在 unchecked 中才视为未选中
-        const item = new LaunchItem(cfg, running, !this.unchecked.has(cfg.name), appPort);
-        (running ? runningItems : idleItems).push(item);
-      }
-      runningItems.sort((a, b) => a.cfg.name.localeCompare(b.cfg.name));
-      idleItems.sort((a, b) => a.cfg.name.localeCompare(b.cfg.name));
+      const { runningItems, idleItems } = this.splitByRunning();
       return [new GroupItem('running', runningItems.length), new GroupItem('idle', idleItems.length)];
     }
     // 分组：返回该组下的配置项
     if (element instanceof GroupItem) {
-      const all = readAllConfigs();
-      const items: LaunchItem[] = [];
-      for (const cfg of all) {
-        const entries = this.sessionMap.get(cfg.name) ?? [];
-        const running = entries.length > 0;
-        if (running !== (element.kind === 'running')) {
-          continue;
-        }
-        const appPort = entries
-          .map((e) => e.appPort)
-          .find((p): p is number => typeof p === 'number');
-        items.push(new LaunchItem(cfg, running, !this.unchecked.has(cfg.name), appPort));
-      }
-      items.sort((a, b) => a.cfg.name.localeCompare(b.cfg.name));
-      return items;
+      const { runningItems, idleItems } = this.splitByRunning();
+      return element.kind === 'running' ? runningItems : idleItems;
     }
     return [];
+  }
+
+  /** 按运行状态切分配置项，组内按名称排序 */
+  private splitByRunning(): { runningItems: LaunchItem[]; idleItems: LaunchItem[] } {
+    const runningItems: LaunchItem[] = [];
+    const idleItems: LaunchItem[] = [];
+    for (const cfg of readAllConfigs()) {
+      const key = keyOfConfig(cfg);
+      const entries = this.sessionMap.get(key) ?? [];
+      const running = entries.length > 0;
+      // 默认全选：仅当配置键出现在 unchecked 中才视为未选中
+      const item = new LaunchItem(cfg, key, running, !this.unchecked.has(key), firstAppPort(entries));
+      (running ? runningItems : idleItems).push(item);
+    }
+    const byName = (a: LaunchItem, b: LaunchItem) => a.cfg.name.localeCompare(b.cfg.name);
+    runningItems.sort(byName);
+    idleItems.sort(byName);
+    return { runningItems, idleItems };
   }
 }
 
@@ -569,6 +604,8 @@ class MultiLaunchProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 // ---------------------------------------------------------------------------
 
 const LAUNCHED_BY_US = '__launchedByPlugin';
+/** 启动时写入配置副本的私有字段：配置唯一键，session 起停时回读 */
+const KEY_FIELD = '__key';
 
 function readAllConfigs(): LaunchConfig[] {
   const result: LaunchConfig[] = [];
@@ -594,9 +631,10 @@ function readAllConfigs(): LaunchConfig[] {
 // 启动 / 停止逻辑
 // ---------------------------------------------------------------------------
 
-/** 将配置名转换为安全的全局 PID 标记标识符 */
-function getMarkerId(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_\-]/g, '_') + '_END';
+/** 将配置唯一键转换为安全、且不易碰撞的全局 PID 标记标识符 */
+function getMarkerId(key: string): string {
+  const safe = key.replace(/[^a-zA-Z0-9_\-]/g, '_');
+  return `${safe}_${hash(key)}_END`;
 }
 
 /** 查找匹配配置名的终端 */
@@ -620,28 +658,28 @@ function findMatchingTerminals(configName: string, unclaimedTerminal?: vscode.Te
 }
 
 async function launchConfig(cfg: LaunchConfig, used: Set<number>): Promise<void> {
+  const key = keyOfConfig(cfg);
   const resolved: vscode.DebugConfiguration = { ...cfg.raw, name: cfg.name };
-  const markerId = getMarkerId(cfg.name);
-  const marker = `-DmultiLauncher.id=${markerId}`;
+  const marker = `-DmultiLauncher.id=${getMarkerId(key)}`;
+
+  (resolved as any)[LAUNCHED_BY_US] = true;
+  (resolved as any)[KEY_FIELD] = key;
 
   if (isJavaConfig(cfg.type)) {
+    // 端口种子仍用配置名，保证同名配置重启后 JMX 端口稳定
     const { jmx, rmi } = await allocPorts(cfg.name, used);
     resolved.vmArgs = mergeVmArgs(cfg.raw.vmArgs, `${buildJmxArgs(jmx, rmi)} ${marker}`);
     // Java 程序强制使用集成终端：确保启动日志可见、端口轮询正常、失败时可查看日志
     resolved.console = 'integratedTerminal';
-    (resolved as any)[LAUNCHED_BY_US] = true;
-    (resolved as any).__jmx = jmx;
-    (resolved as any).__rmi = rmi;
-  } else {
-    (resolved as any)[LAUNCHED_BY_US] = true;
+    (resolved as any).__jmxPort = jmx;
+    (resolved as any).__rmiPort = rmi;
   }
   await vscode.debug.startDebugging(cfg.folder, resolved);
 }
 
 /** 按 multiLauncher.id 标记，在操作系统层面精准杀掉该进程（多平台） */
-async function killProcessByMarker(name: string): Promise<void> {
-  const markerId = getMarkerId(name);
-  const marker = `multiLauncher.id=${markerId}`;
+async function killProcessByMarker(key: string): Promise<void> {
+  const marker = `multiLauncher.id=${getMarkerId(key)}`;
   const cmd =
     process.platform === 'win32'
       ? `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"CommandLine like '%${marker}%'\\" | Invoke-CimMethod -MethodName Terminate"`
@@ -658,10 +696,11 @@ async function stopConfig(
   sessionMap: Map<string, SessionEntry[]>,
   unclaimedTerminal?: vscode.Terminal
 ): Promise<void> {
-  const entries = sessionMap.get(cfg.name) ?? [];
+  const key = keyOfConfig(cfg);
+  const entries = sessionMap.get(key) ?? [];
 
   // 1) 先杀掉进程（操作系统层面按唯一标记精准杀）
-  await killProcessByMarker(cfg.name);
+  await killProcessByMarker(key);
 
   // 2) 断开调试会话并关闭关联终端
   for (const e of entries) {
@@ -688,7 +727,7 @@ async function stopConfig(
     } catch {}
   }
 
-  sessionMap.delete(cfg.name);
+  sessionMap.delete(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -715,16 +754,17 @@ export function activate(context: vscode.ExtensionContext) {
   // 记录本插件启动的 session
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession((session) => {
-      const cfg = (session.configuration as any)[LAUNCHED_BY_US];
-      if (!cfg) {
+      if (!(session.configuration as any)[LAUNCHED_BY_US]) {
         return;
       }
       const name = session.configuration.name as string;
-      const list = sessionMap.get(name) ?? [];
+      const key = keyOfSession(session);
+      const list = sessionMap.get(key) ?? [];
       const entry: SessionEntry = {
         session,
-        jmx: (session.configuration as any).__jmx,
-        rmi: (session.configuration as any).__rmi,
+        key,
+        jmx: (session.configuration as any).__jmxPort,
+        rmi: (session.configuration as any).__rmiPort,
       };
 
       const terms = findMatchingTerminals(name, lastUnclaimedTerminal);
@@ -737,7 +777,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
 
       list.push(entry);
-      sessionMap.set(name, list);
+      sessionMap.set(key, list);
 
       // 登记到共享轮询器：在操作系统层面批量探测各 session 的 TCP 监听端口
       // （解决 console: integratedTerminal 时 DAP 收不到日志、端口解析不到的问题）
@@ -776,11 +816,14 @@ export function activate(context: vscode.ExtensionContext) {
 
       // 1) 优先匹配正在运行的 session（取最长匹配，避免短名误匹配）
       let bestLen = 0;
-      for (const [name, entries] of sessionMap) {
-        const target = name.toLowerCase();
-        if ((tName.includes(target) || target.includes(tName)) && name.length > bestLen) {
-          const entry = entries.find((e) => !e.terminal);
-          if (entry) {
+      for (const entries of sessionMap.values()) {
+        for (const entry of entries) {
+          if (entry.terminal) {
+            continue;
+          }
+          const name = entry.session.configuration.name as string;
+          const target = name.toLowerCase();
+          if ((tName.includes(target) || target.includes(tName)) && name.length > bestLen) {
             claimedEntry = entry;
             claimedName = name;
             bestLen = name.length;
@@ -819,7 +862,6 @@ export function activate(context: vscode.ExtensionContext) {
         if (!(session.configuration as any)[LAUNCHED_BY_US]) {
           return undefined; // 仅跟踪本插件启动的 session
         }
-        const name = session.configuration.name as string;
         return {
           onDidSendMessage(message: any) {
             if (message && message.type === 'event' && message.event === 'output' && message.body) {
@@ -827,7 +869,7 @@ export function activate(context: vscode.ExtensionContext) {
               if (!text) {
                 return;
               }
-              const entry = (sessionMap.get(name) ?? []).find((x) => x.session.id === session.id);
+              const entry = findEntryBySessionId(sessionMap, session.id);
               if (entry && !entry.portVerified) {
                 entry.outputBuffer = (entry.outputBuffer ?? '') + text;
                 if (entry.outputBuffer.length > 20000) {
@@ -867,8 +909,9 @@ export function activate(context: vscode.ExtensionContext) {
       if (!isOurSession) {
         return;
       }
+      const key = keyOfSession(session);
       const name = session.configuration.name as string;
-      const list = sessionMap.get(name);
+      const list = sessionMap.get(key);
       if (!list) {
         return;
       }
@@ -877,15 +920,15 @@ export function activate(context: vscode.ExtensionContext) {
         const [entry] = list.splice(idx, 1);
         unregisterPolling(entry);
         if (list.length === 0) {
-          sessionMap.delete(name);
+          sessionMap.delete(key);
         }
 
         // 当调试会话结束（包含从顶部调试工具栏强行停止）时，彻底清理进程和终端
         void (async () => {
-          await killProcessByMarker(name);
+          await killProcessByMarker(key);
           // 仅「主动停止」时才关闭终端；启动失败（session 自行异常终止）时保留终端，
           // 方便用户查看失败日志。
-          if (activelyStopping.has(name)) {
+          if (activelyStopping.has(key)) {
             if (entry.terminal) {
               try {
                 entry.terminal.sendText('\x03', true);
@@ -922,12 +965,12 @@ export function activate(context: vscode.ExtensionContext) {
   // 单个停止
   context.subscriptions.push(
     vscode.commands.registerCommand('multiLauncher.stopOne', async (item: LaunchItem) => {
-      activelyStopping.add(item.cfg.name);
+      activelyStopping.add(item.key);
       try {
         await stopConfig(item.cfg, sessionMap, lastUnclaimedTerminal);
       } finally {
         // 延迟移除标记，避免与 onDidTerminateDebugSession 的触发时序竞争
-        setTimeout(() => activelyStopping.delete(item.cfg.name), 2000);
+        setTimeout(() => activelyStopping.delete(item.key), 2000);
       }
     })
   );
@@ -935,7 +978,7 @@ export function activate(context: vscode.ExtensionContext) {
   // 单击任意项（运行中或已停止/启动失败）→ 聚焦该程序的集成终端查看日志
   context.subscriptions.push(
     vscode.commands.registerCommand('multiLauncher.focusOne', async (item: LaunchItem) => {
-      const entries = sessionMap.get(item.cfg.name) ?? [];
+      const entries = sessionMap.get(item.key) ?? [];
 
       // 1) 优先用本插件跟踪到的终端（运行中项）
       const entry = entries[entries.length - 1];
@@ -986,79 +1029,99 @@ export function activate(context: vscode.ExtensionContext) {
       for (const [item, state] of e.items) {
         const li = item as LaunchItem;
         if (state === vscode.TreeItemCheckboxState.Checked) {
-          unchecked.delete(li.cfg.name);
+          unchecked.delete(li.key);
         } else {
-          unchecked.add(li.cfg.name);
+          unchecked.add(li.key);
         }
       }
     })
   );
 
-  // 启动所有未运行且被勾选的配置（「全部运行」）
-  const launchAllIdle = async (): Promise<void> => {
-    const all = readAllConfigs();
-    const targets = all.filter(
-      (c) => !unchecked.has(c.name) && (sessionMap.get(c.name) ?? []).length === 0
-    );
-    if (targets.length === 0) {
-      vscode.window.showInformationMessage(l10n('allRunning'));
-      return;
-    }
+  /** 该配置当前是否有本插件启动的活跃 session */
+  const isRunning = (cfg: LaunchConfig): boolean =>
+    (sessionMap.get(keyOfConfig(cfg)) ?? []).length > 0;
+
+  /** 统一分配 Java 端口（共享 used 集合）后逐个启动 */
+  const launchConfigs = async (targets: LaunchConfig[]): Promise<void> => {
     const used = new Set<number>();
     for (const cfg of targets) {
       await launchConfig(cfg, used);
     }
   };
 
-  // 多选启动：启动所有被勾选的项（视图标题栏「全部运行」）
+  /** 勾选且未运行的配置（复选框语义） */
+  const checkedIdleConfigs = (): LaunchConfig[] =>
+    readAllConfigs().filter((c) => !unchecked.has(keyOfConfig(c)) && !isRunning(c));
+
+  // 未运行分组「运行全部」：启动所有被勾选且未运行的配置
+  const launchAllIdle = async (): Promise<void> => {
+    const targets = checkedIdleConfigs();
+    if (targets.length === 0) {
+      vscode.window.showInformationMessage(l10n('allRunning'));
+      return;
+    }
+    await launchConfigs(targets);
+  };
+
+  // 多选启动：优先启动当前选中的项；没有选中项时退化为「勾选且未运行」
+  const launchSelected = async (...args: unknown[]): Promise<void> => {
+    const selected = flattenLaunchItems(args);
+    if (selected.length === 0) {
+      await launchAllIdle();
+      return;
+    }
+    const targets = selected.map((i) => i.cfg).filter((c) => !isRunning(c));
+    if (targets.length === 0) {
+      vscode.window.showInformationMessage(l10n('allRunning'));
+      return;
+    }
+    await launchConfigs(targets);
+  };
+
+  // 视图标题栏「启动选中项」
   context.subscriptions.push(
-    vscode.commands.registerCommand('multiLauncher.launchSelected', launchAllIdle)
+    vscode.commands.registerCommand('multiLauncher.launchSelected', launchSelected)
   );
 
-  // 未运行分组「运行全部」：启动该分组下所有未运行的配置
+  // 未运行分组「运行全部」
   context.subscriptions.push(
     vscode.commands.registerCommand('multiLauncher.launchAllIdle', launchAllIdle)
   );
 
   // 配置启动项：打开图形化配置编辑器
 	  const configEditor = new LaunchConfigEditor(context);
-	  context.subscriptions.push(
-	    vscode.commands.registerCommand('multiLauncher.configureLaunch', () => configEditor.show())
-	  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand('multiLauncher.configureLaunch', () => configEditor.show())
+  );
 
-	  // 停止全部：停止「运行中」分组下的所有程序
-	  context.subscriptions.push(
-	    vscode.commands.registerCommand('multiLauncher.stopAllRunning', async () => {
-      // 收集所有正在运行的配置名（stopConfig 会修改 sessionMap，需先快照）
-      const runningNames: string[] = [];
-      for (const [name, entries] of sessionMap) {
-        if (entries.length > 0) {
-          runningNames.push(name);
-        }
-      }
-      if (runningNames.length === 0) {
+  // 停止全部：停止「运行中」分组下的所有程序
+  context.subscriptions.push(
+    vscode.commands.registerCommand('multiLauncher.stopAllRunning', async () => {
+      // 收集所有正在运行的配置键（stopConfig 会修改 sessionMap，需先快照）
+      const runningKeys = Array.from(sessionMap.keys());
+      if (runningKeys.length === 0) {
         vscode.window.showInformationMessage(l10n('nothingRunning'));
         return;
       }
       const allCfgs = readAllConfigs();
-      for (const name of runningNames) {
-        const cfg = allCfgs.find((c) => c.name === name);
+      for (const key of runningKeys) {
+        const cfg = allCfgs.find((c) => keyOfConfig(c) === key);
         if (!cfg) {
           // 配置可能已从 launch.json 移除，但仍需清理残留 session
-          for (const e of sessionMap.get(name) ?? []) {
+          for (const e of sessionMap.get(key) ?? []) {
             unregisterPolling(e);
             try {
               await vscode.debug.stopDebugging(e.session);
             } catch {}
           }
-          sessionMap.delete(name);
+          sessionMap.delete(key);
           continue;
         }
-        activelyStopping.add(name);
+        activelyStopping.add(key);
         try {
           await stopConfig(cfg, sessionMap, lastUnclaimedTerminal);
         } finally {
-          setTimeout(() => activelyStopping.delete(name), 2000);
+          setTimeout(() => activelyStopping.delete(key), 2000);
         }
       }
       provider.refresh();

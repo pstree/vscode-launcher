@@ -7,5 +7,6 @@
   "cmd.stopOne": "Stop",
   "cmd.stopAllRunning": "Stop All Running",
   "cmd.configureLaunch": "Configure Launch",
-  "cmd.launchAllIdle": "Launch All Not Running"
+  "cmd.launchAllIdle": "Launch All Not Running",
+  "config.portPatterns.description": "Additional regex patterns to detect application ports from debug output (case-insensitive)."
 }

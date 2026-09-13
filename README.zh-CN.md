@@ -9,6 +9,7 @@
 - **自由多选**：使用 TreeView 原生复选框，勾选你想要的项，其余保持不动。
 - **一键批量启动**：选中多个配置后，点击标题栏的「启动选中项」即可同时启动。
 - **逐项 inline 操作**：每个配置项自带 `[▶ 启动]` / `[■ 停止]` 按钮，可单独启停。
+- **分组批量操作**：「未运行」分组可一键运行全部未运行项（或全部勾选项），「运行中」分组可一键停止全部。
 - **单击定位输出**：单击运行中项可聚焦其集成终端，查看该程序输出。
 - **Java 自动注入 JMX**：类型为 `java` 的配置启动时自动追加 JMX 远程 `vmArgs`，端口随机分配且同批次不冲突；非 Java 配置原样启动。
 - **程序端口显示**：运行中项后面显示程序自身监听的端口（如 `:8080`）；抓不到则不显示（绝不编造）。JMX 调试端口不在视图显示。
@@ -83,4 +84,4 @@ npx @vscode/vsce package --allow-missing-repository
 ## 适用范围
 
 - 仅支持 `launch.json` 的**顶层** `configurations`，不支持 `compounds`（组合配置）。
-- 需要 VS Code `>= 1.84`（TreeView `multiSelect` 与复选框所需）。
+- 需要 VS Code `>= 1.84`（TreeView `canSelectMany` 与 `TreeItemCheckboxState` 所需）。

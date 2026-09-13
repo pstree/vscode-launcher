@@ -9,6 +9,7 @@ A VS Code extension that lets you **multi-select** launch configurations from `l
 - **Free multi-selection**: Native TreeView checkboxes — tick the boxes you want, all others stay untouched.
 - **Batch launch in one click**: After selecting configurations, click **Launch Selected** in the view title bar to start them all simultaneously.
 - **Per-item inline actions**: Each configuration has a `[▶ Launch]` / `[■ Stop]` inline button for individual start/stop.
+- **Group batch actions**: The **Not running** group can launch every not-running (or every ticked) configuration at once, and the **Running** group can stop them all at once.
 - **Click to focus output**: Clicking a running item focuses its integrated terminal so you can read that program's output.
 - **Java JMX auto-injection**: When a configuration of type `java` starts, JMX remote `vmArgs` are appended automatically with randomly allocated, batch-conflict-free ports. Non-Java configurations launch unchanged.
 - **Application port display**: A running item shows the application's own listening port (e.g. `:8080`); if it can't be detected, nothing is shown (never faked). The JMX debug port is not shown in the view.
