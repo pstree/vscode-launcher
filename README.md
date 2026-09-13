@@ -18,7 +18,7 @@ A VS Code extension that lets you **multi-select** launch configurations from `l
   - Browse every configuration with its parameters.
   - Edit any parameter (string / number / boolean / array / object), add or remove parameters, and save directly back to `launch.json`.
   - **Auto-scan the project** ("一键新增" / *Scan & Add*) to detect launchable entries for **Node.js** (`package.json` `main` and `start`/`dev`/`serve` scripts), **Python** (entry files like `main.py`, `app.py`, …), and **Java** (classes with a `main` method), then append them automatically.
-  - **Batch-add `envFile`** to every configuration at once.
+  - **Add environment variables**: add `envFile: ${workspaceFolder}/.env` to every configuration at once, and create / top up a `.env` in each workspace root containing `SPRING_PROFILES_ACTIVE=dev` and `SPRING_OUTPUT_ANSI_ENABLED=true` (existing keys are never overwritten — only missing ones are appended).
   - Delete configurations.
 - **Accurate OS-level port detection**: For Java launches using the integrated terminal, the app port is detected by probing the actual OS listening sockets of the launched process (via `Get-NetTCPConnection` / `lsof` / `ss`), correctly attributed per process and excluding debug/JMX ports.
 - **Robust stop**: Stopping a configuration kills the process at the OS level by a unique marker, disconnects the debug session, and closes the associated terminal. Failed starts keep their terminal open so you can inspect the error log.

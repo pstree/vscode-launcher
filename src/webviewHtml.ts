@@ -472,7 +472,7 @@ export function getWebviewContent(t: Record<string, string>): string {
       <div class="sidebar-header">
         <span>${t.sidebarTitle}</span>
         <button class="add-btn" id="addConfigBtn" title="${t.btnScanAddTitle}" style="margin-right:4px;">${t.btnScanAdd}</button>
-        <button class="add-btn" id="addEnvFileBtn" title="${t.btnAddEnvFileTitle}">${t.btnAddEnvFile}</button>
+        <button class="add-btn" id="addEnvVarsBtn" title="${t.btnAddEnvVarsTitle}">${t.btnAddEnvVars}</button>
       </div>
       <div class="config-list" id="${CONFIG_LIST_ID}">
         <div class="empty-list">${t.loading}</div>
@@ -510,7 +510,7 @@ export function getWebviewContent(t: Record<string, string>): string {
     let currentParams = [];     // 当前显示的参数（来自文件或上次保存）
     let dirty = false;          // 是否有未保存的修改
     let expandedConfigs = {};   // 左侧展开状态：key = folderIndex:configIndex
-    let loadingAction = null;   // 当前正在进行的操作：'delete' | 'save' | 'addConfig' | 'addEnvFile' | null
+    let loadingAction = null;   // 当前正在进行的操作：'delete' | 'save' | 'addConfig' | 'addEnvVars' | null
 
     // ===== Loading 控制 =====
     function startLoading(action, btnEl) {
@@ -1042,10 +1042,10 @@ export function getWebviewContent(t: Record<string, string>): string {
       vscode.postMessage({ type: 'addConfig' });
     });
 
-    $('addEnvFileBtn').addEventListener('click', () => {
+    $('addEnvVarsBtn').addEventListener('click', () => {
       if (loadingAction) return;
-      startLoading('addEnvFile', $('addEnvFileBtn'));
-      vscode.postMessage({ type: 'addEnvFileToAll' });
+      startLoading('addEnvVars', $('addEnvVarsBtn'));
+      vscode.postMessage({ type: 'addEnvVars' });
     });
 
     // ===== 接收扩展消息 =====
@@ -1065,9 +1065,9 @@ export function getWebviewContent(t: Record<string, string>): string {
           showToast(T('savedToast'));
           // configList 消息已包含最新数据，无需再发 ready 触发可能读到旧数据的 refreshConfigList
           break;
-        case 'envFileAdded':
+        case 'envVarsAdded':
           endLoading();
-          showToast(T('envFileAddedToast'));
+          showToast(T('envVarsAddedToast'));
           // configList 消息已包含最新数据，无需再发 ready
           // 刷新右侧面板（如果已选中配置）
           if (selectedFolderIndex >= 0 && selectedConfigIndex >= 0) {

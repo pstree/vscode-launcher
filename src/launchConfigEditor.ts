@@ -17,6 +17,7 @@ import {
   writeLaunchJson,
 } from './launchConfigStore';
 import { scanProjectForLaunchConfigs } from './projectScanner';
+import { ensureEnvFiles } from './envFile';
 import { getWebviewContent } from './webviewHtml';
 
 // ---------------------------------------------------------------------------
@@ -34,15 +35,16 @@ type WebviewMessage =
   | ({ type: 'deleteConfig' } & ConfigRef)
   | { type: 'addConfig' }
   | ({ type: 'saveConfig'; raw: Record<string, any> } & ConfigRef)
-  | { type: 'addEnvFileToAll' };
+  | { type: 'addEnvVars' };
 
 type ExtensionMessage =
   | { type: 'configList'; configs: ConfigListItem[] }
   | { type: 'configDetail'; config: LaunchConfigInfo; params: EditableParam[] }
   | ({ type: 'saved' } & ConfigRef)
-  | { type: 'envFileAdded' }
+  | { type: 'envVarsAdded' }
   | ({ type: 'configDeleted' } & ConfigRef);
 
+/** 写入各 launch 配置的 envFile 路径；与 .env 实际落盘位置一致 */
 const ENV_FILE_VALUE = '${workspaceFolder}/.env';
 
 // ---------------------------------------------------------------------------
@@ -213,8 +215,8 @@ export class LaunchConfigEditor {
         break;
       }
 
-      case 'addEnvFileToAll': {
-        // 按 folderIndex 分组，浅拷贝后替换对象（与 saveConfig 一致的方式）
+      case 'addEnvVars': {
+        // 1) 为所有缺 envFile 的配置补齐 envFile（按 folderIndex 分组，浅拷贝后替换对象）
         const groups = new Map<number, any[]>();
         for (const c of readAllLaunchConfigs()) {
           const list = groups.get(c.folderIndex) ?? [];
@@ -238,16 +240,25 @@ export class LaunchConfigEditor {
           try {
             await writeLaunchJson(folderIndex, cfgs);
           } catch (err: any) {
-            vscode.window.showErrorMessage(l10n('envFileFailed', err.message));
+            vscode.window.showErrorMessage(l10n('envFileAddFailed', err.message));
             break;
           }
           // 直接更新内存缓存，避免 getConfiguration 尚未刷新导致读到旧数据
           this.syncCachedRaw(folderIndex, cfgs);
         }
 
+        // 2) 创建 / 补齐各 folder 根目录的 .env（即 envFile 指向的路径），
+        //    写入默认环境变量；已存在的键一律不覆盖。
+        let envFilesWritten = 0;
+        try {
+          envFilesWritten = await ensureEnvFiles();
+        } catch (err: any) {
+          vscode.window.showErrorMessage(l10n('dotEnvWriteFailed', err.message));
+        }
+
         this.postConfigList();
-        this.postMessage({ type: 'envFileAdded' });
-        vscode.window.showInformationMessage(l10n('envFileAdded', addedCount));
+        this.postMessage({ type: 'envVarsAdded' });
+        vscode.window.showInformationMessage(l10n('envVarsAdded', addedCount, envFilesWritten));
         break;
       }
 

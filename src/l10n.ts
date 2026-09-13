@@ -29,12 +29,13 @@ const zhCN: Messages = {
   deleteFailed: '删除失败: {0}',
   saveFailed: '保存失败: {0}',
   addFailed: '新增失败: {0}',
-  envFileFailed: '添加 envFile 失败: {0}',
+  envFileAddFailed: '添加 envFile 失败: {0}',
+  dotEnvWriteFailed: '写入 .env 失败: {0}',
   noLaunchable: '未在项目中检测到可启动的项（Node.js / Python / Java）',
   allConfigsExist: '检测到 {0} 个启动项，但已全部存在',
   scanDone: '扫描完成，新增 {0} 个启动配置',
   scanDoneWithExisting: '扫描完成，新增 {0} 个启动配置（{1} 个已存在）',
-  envFileAdded: '已为 {0} 个启动项添加 envFile',
+  envVarsAdded: '已为 {0} 个启动项添加 envFile，并写入 {1} 个 .env 文件',
 };
 
 const en: Messages = {
@@ -51,12 +52,13 @@ const en: Messages = {
   deleteFailed: 'Delete failed: {0}',
   saveFailed: 'Save failed: {0}',
   addFailed: 'Add failed: {0}',
-  envFileFailed: 'Adding envFile failed: {0}',
+  envFileAddFailed: 'Adding envFile failed: {0}',
+  dotEnvWriteFailed: 'Writing .env failed: {0}',
   noLaunchable: 'No launchable item (Node.js / Python / Java) was detected in the project.',
   allConfigsExist: 'Detected {0} launch items, but all of them already exist.',
   scanDone: 'Scan finished, {0} launch configurations added',
   scanDoneWithExisting: 'Scan finished, {0} launch configurations added ({1} already existed)',
-  envFileAdded: 'envFile added to {0} launch items',
+  envVarsAdded: 'envFile added to {0} launch items; {1} .env file(s) written',
 };
 
 // ---------------------------------------------------------------------------
@@ -69,8 +71,8 @@ const webviewZhCN: Messages = {
   sidebarTitle: '启动配置',
   btnScanAdd: '一键新增',
   btnScanAddTitle: '扫描项目并自动添加启动配置',
-  btnAddEnvFile: '批量添加envFile',
-  btnAddEnvFileTitle: '为所有启动项添加 envFile',
+  btnAddEnvVars: '添加环境变量',
+  btnAddEnvVarsTitle: '为所有启动项添加 envFile，并创建 .env 写入默认环境变量',
   loading: '加载中...',
   selectHint: '选择左侧配置',
   detailEmpty: '请从左侧列表选择一个启动配置来编辑其参数',
@@ -95,7 +97,7 @@ const webviewZhCN: Messages = {
   paramExists: '参数 "{0}" 已存在',
   paramAdded: '已添加参数 "{0}"（点击保存生效）',
   savedToast: '已保存',
-  envFileAddedToast: '已为所有启动项添加 envFile',
+  envVarsAddedToast: '已添加环境变量',
 };
 
 const webviewEn: Messages = {
@@ -104,8 +106,8 @@ const webviewEn: Messages = {
   sidebarTitle: 'Launch Configurations',
   btnScanAdd: 'Scan & Add',
   btnScanAddTitle: 'Scan the project and add launch configurations automatically',
-  btnAddEnvFile: 'Add envFile to All',
-  btnAddEnvFileTitle: 'Add envFile to all launch items',
+  btnAddEnvVars: 'Add Env Variables',
+  btnAddEnvVarsTitle: 'Add envFile to all launch items and create .env with default variables',
   loading: 'Loading...',
   selectHint: 'Select a configuration',
   detailEmpty: 'Select a launch configuration from the list to edit its parameters',
@@ -130,7 +132,7 @@ const webviewEn: Messages = {
   paramExists: 'Parameter "{0}" already exists',
   paramAdded: 'Parameter "{0}" added (click Save to apply)',
   savedToast: 'Saved',
-  envFileAddedToast: 'envFile added to all launch items',
+  envVarsAddedToast: 'Environment variables added',
 };
 
 function isSimplifiedChinese(): boolean {

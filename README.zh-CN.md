@@ -18,7 +18,7 @@
   - 浏览每个配置及其参数。
   - 编辑任意参数（字符串 / 数字 / 布尔 / 数组 / 对象），新增或删除参数，并直接保存回 `launch.json`。
   - **自动扫描项目**（「一键新增」）：检测 **Node.js**（`package.json` 的 `main` 与主入口，以及 `start`/`dev`/`serve` 脚本）、**Python**（入口文件如 `main.py`、`app.py` 等）、**Java**（含 `main` 方法的类），并自动追加为启动配置。
-  - **批量添加 `envFile`**：一次性为所有配置添加 `envFile`。
+  - **添加环境变量**：一次性为所有配置补上 `envFile: ${workspaceFolder}/.env`，并在各工作区根目录创建 / 补齐 `.env`，写入 `SPRING_PROFILES_ACTIVE=dev` 与 `SPRING_OUTPUT_ANSI_ENABLED=true`（已存在的键不会被覆盖，只补缺失项）。
   - 删除配置。
 - **精准的 OS 级端口探测**：对于使用集成终端启动的 Java 程序，扩展通过查询进程实际在操作系统层面监听的 TCP 端口（`Get-NetTCPConnection` / `lsof` / `ss`）来识别应用端口，按进程正确归属，并排除调试/JMX 端口。
 - **可靠的停止**：停止配置时会按唯一标记在操作系统层面精准杀掉进程，断开调试会话并关闭关联终端；启动失败的项保留终端，方便查看报错日志。
